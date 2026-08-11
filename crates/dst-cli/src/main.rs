@@ -123,6 +123,11 @@ fn emit_migrate(result: &MigrateResult, dry_run: bool) -> ExitCode {
         }
         if result.changes.is_empty() {
             println!("(no changes — nothing to migrate)");
+        } else {
+            println!(
+                "\nwarning: --dry-run shows the planned rewrite but does NOT run `cargo check`; \
+                 applying it (without --dry-run) may still fail to compile and be reverted."
+            );
         }
     }
 

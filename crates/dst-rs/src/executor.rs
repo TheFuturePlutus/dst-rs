@@ -33,6 +33,12 @@ impl std::error::Error for TimedOut {}
 /// making timeout-path tests deterministic (ADR-0022 §A3 + Step 3 §4.11
 /// Option β — a free helper using `Time::sleep` rather than widening the
 /// `Time` trait).
+///
+/// **Cancellation-unsafe**, exactly like `tokio::time::timeout`: when the
+/// timeout wins the `select!`, `future` is dropped at whatever `.await` point it
+/// had reached. Any effect it had already applied is *not* rolled back, and any
+/// work in flight at that suspension point is abandoned. Only pass futures that
+/// are safe to drop mid-flight (or make the operation idempotent / retryable).
 pub async fn timeout<T: Time + ?Sized, F: Future>(
     time: &T,
     duration: Duration,
@@ -105,10 +111,15 @@ impl Executor for ProductionExecutor {
 ///
 /// The full single-threaded deterministic scheduler (per
 /// `pulse-architecture-v1.md` §10.5) lands in a later phase when
-/// cross-task interleaving needs to be controlled by the harness.
-/// Phase 0's tests run against the multi-threaded `tokio` runtime;
-/// determinism in Phase 0 is provided by `Time` and `Random`, not by
-/// scheduler control.
+/// cross-task interleaving needs to be controlled by the harness — that
+/// scheduler is [`crate::SimScheduler`].
+///
+/// This executor runs tasks on the multi-threaded `tokio` runtime and only
+/// *counts* spawns; it does **not** by itself make a workload deterministic.
+/// `Time` and `Random` are reproducible only under single-threaded drive
+/// (see [`crate::SimScheduler`]); spawning shared clocks/RNGs across `tokio`
+/// worker threads through this executor gives a run-to-run-varying interleaving.
+/// For a replayable run, drive the workload on [`crate::SimScheduler`].
 pub struct SimulatedExecutor {
     spawned: Mutex<u64>,
 }

@@ -195,6 +195,7 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
             impl_stack: Vec::new(),
             closure_depth: 0,
             consumed: Vec::new(),
+            cast_guarded: Vec::new(),
             rewrites: Vec::new(),
             literals: Vec::new(),
             skips: Vec::new(),
@@ -256,6 +257,21 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
                 continue;
             }
             if lit.already_has_time {
+                continue;
+            }
+            if lit.has_rest {
+                // `Foo { .., ..base }` — the base already supplies every unset
+                // field (including the injected `time`). Inserting our own
+                // `time: default` here would OVERRIDE the base's clock with the
+                // production default. Skip the insert and report so the author
+                // confirms the base carries the intended clock.
+                all_skips.push(make_skip(
+                    &p.display,
+                    &p.source,
+                    lit.lit_start,
+                    lit.lit_end,
+                    "struct literal uses `..base` update syntax — the base supplies `time`; not inserting a default (confirm the base carries the intended clock)",
+                ));
                 continue;
             }
             edits.push(Edit {
@@ -411,8 +427,19 @@ struct StructDef {
     /// Byte offset just past the opening `{` of the named-field brace, or
     /// `None` for tuple/unit structs (which cannot receive a named field).
     field_brace_open_end: Option<usize>,
-    /// The struct already has a field literally named `time` (idempotency).
+    /// The struct already carries the INJECTED clock field — a field named
+    /// `time` whose type is `Arc<dyn ...Time>` (idempotency). A domain field
+    /// merely *named* `time` (e.g. `time: u64`) does NOT set this; see
+    /// `time_conflict`.
     has_time: bool,
+    /// The struct has a field named `time` of some OTHER type — injecting our
+    /// own `time` field would collide, so such a struct cannot be migrated.
+    time_conflict: bool,
+    /// The struct has a `#[derive(...)]` naming a trait that `Arc<dyn Time>`
+    /// cannot satisfy (see [`DERIVE_BLOCKERS`]). Such a struct is skipped:
+    /// injecting the field would fail the derive and, via the all-or-nothing
+    /// `cargo check`, revert the whole run.
+    blocking_derive: bool,
 }
 
 struct StructCollector<'a> {
@@ -420,25 +447,112 @@ struct StructCollector<'a> {
     defs: &'a mut BTreeMap<String, StructDef>,
 }
 
+/// Derive traits that a `time: Arc<dyn dst_rs::Time>` field cannot satisfy, so
+/// injecting the field would fail the derive and — via the all-or-nothing
+/// `cargo check` — revert the whole run. `Arc<dyn Time>` is not
+/// `Debug`/`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`, not `Copy`, and not
+/// `Default` (`dyn Time` is unsized and has no `Default`). The common serde
+/// derives are included too — they fail identically (`Arc<dyn Time>` is neither
+/// `Serialize` nor `Deserialize`). `Clone` is intentionally ABSENT — `Arc<dyn
+/// Time>` *is* `Clone`. Over-inclusion here is safe: it only causes a struct to
+/// be reported as a manual skip rather than migrated; under-inclusion nukes the
+/// entire run, so we err toward skipping.
+const DERIVE_BLOCKERS: &[&str] = &[
+    "Debug",
+    "PartialEq",
+    "Eq",
+    "Hash",
+    "PartialOrd",
+    "Ord",
+    "Copy",
+    "Default",
+    "Serialize",
+    "Deserialize",
+];
+
+/// Collect the trait idents inside every `#[derive(...)]` on `attrs`.
+fn derive_idents(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        if attr.path().is_ident("derive") {
+            let _ = attr.parse_nested_meta(|meta| {
+                if let Some(id) = meta.path.get_ident() {
+                    out.push(id.to_string());
+                }
+                Ok(())
+            });
+        }
+    }
+    out
+}
+
+/// Whether `ty` is the injected clock shape `Arc<dyn ...Time>` (any path to a
+/// trait object whose final bound is a `Time` trait). Used so a domain field
+/// `time: u64` is NOT mistaken for an already-migrated struct.
+fn is_arc_dyn_time(ty: &syn::Type) -> bool {
+    let syn::Type::Path(tp) = ty else {
+        return false;
+    };
+    let Some(seg) = tp.path.segments.last() else {
+        return false;
+    };
+    if seg.ident != "Arc" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return false;
+    };
+    for a in &args.args {
+        if let syn::GenericArgument::Type(syn::Type::TraitObject(to)) = a {
+            for b in &to.bounds {
+                if let syn::TypeParamBound::Trait(tb) = b {
+                    if tb
+                        .path
+                        .segments
+                        .last()
+                        .map(|s| s.ident == "Time")
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 impl<'ast> Visit<'ast> for StructCollector<'_> {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         let name = node.ident.to_string();
-        let (brace_open_end, has_time) = match &node.fields {
+        let blocking_derive = derive_idents(&node.attrs)
+            .iter()
+            .any(|d| DERIVE_BLOCKERS.contains(&d.as_str()));
+        let (brace_open_end, has_time, time_conflict) = match &node.fields {
             syn::Fields::Named(named) => {
                 let open_end = named.brace_token.span.open().byte_range().end;
-                let has_time = named
-                    .named
-                    .iter()
-                    .any(|f| f.ident.as_ref().map(|i| i == "time").unwrap_or(false));
-                (Some(open_end), has_time)
+                let mut injected = false;
+                let mut conflict = false;
+                for f in &named.named {
+                    if f.ident.as_ref().map(|i| i == "time").unwrap_or(false) {
+                        if is_arc_dyn_time(&f.ty) {
+                            injected = true;
+                        } else {
+                            conflict = true;
+                        }
+                    }
+                }
+                (Some(open_end), injected, conflict)
             }
-            _ => (None, false),
+            _ => (None, false, false),
         };
         // First definition wins (there should only be one per name in scope).
         self.defs.entry(name).or_insert(StructDef {
             file: self.file.to_string(),
             field_brace_open_end: brace_open_end,
             has_time,
+            time_conflict,
+            blocking_derive,
         });
         visit::visit_item_struct(self, node);
     }
@@ -459,7 +573,16 @@ struct StructLiteral {
     struct_name: String,
     /// Byte offset just past the literal's opening `{`.
     brace_open_end: usize,
+    /// Byte offset of the literal's start (its path) — for skip location/snippet.
+    lit_start: usize,
+    /// Byte offset of the end of the literal — for skip snippet.
+    lit_end: usize,
     already_has_time: bool,
+    /// The literal uses struct-update syntax (`..base`). Such a literal already
+    /// inherits every unset field (including an injected `time`) from `base`, so
+    /// inserting our own `time: default` would OVERRIDE the base's clock. We skip
+    /// the insert and report it instead.
+    has_rest: bool,
 }
 
 /// What kind of enclosing function a leak sits in.
@@ -490,58 +613,76 @@ struct TransformVisitor<'a> {
     /// Byte ranges already consumed by a `SystemTime::now()…as_millis()`
     /// match, so the inner `SystemTime::now()` call is not double-reported.
     consumed: Vec<(usize, usize)>,
+    /// Byte ranges of `SystemTime::now()…as_millis()` chains that sit directly
+    /// under an integer `as` cast, so rewriting them to the `i64`-typed
+    /// `now_ms()` is type-safe. Populated in `visit_expr_cast` before the inner
+    /// method call is visited.
+    cast_guarded: Vec<(usize, usize)>,
     rewrites: Vec<Rewrite>,
     literals: Vec<StructLiteral>,
     skips: Vec<Skip>,
 }
 
-impl TransformVisitor<'_> {
-    fn line_col(&self, byte: usize) -> (usize, usize) {
-        // 1-based line, 1-based col from a byte offset into `source`.
-        let mut line = 1usize;
-        let mut col = 1usize;
-        for (i, ch) in self.source.char_indices() {
-            if i >= byte {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
+/// 1-based line, 1-based col from a byte offset into `source`.
+fn line_col(source: &str, byte: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for (i, ch) in source.char_indices() {
+        if i >= byte {
+            break;
         }
-        (line, col)
-    }
-
-    fn snippet(&self, start: usize, end: usize) -> String {
-        let raw: String = self.source[start..end.min(self.source.len())]
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if raw.chars().count() > 80 {
-            let short: String = raw.chars().take(79).collect();
-            format!("{short}…")
+        if ch == '\n' {
+            line += 1;
+            col = 1;
         } else {
-            raw
+            col += 1;
         }
     }
+    (line, col)
+}
 
+/// The first source line of the span `[start, end)`, trimmed and length-capped.
+fn snippet(source: &str, start: usize, end: usize) -> String {
+    let raw: String = source[start.min(source.len())..end.min(source.len())]
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if raw.chars().count() > 80 {
+        let short: String = raw.chars().take(79).collect();
+        format!("{short}…")
+    } else {
+        raw
+    }
+}
+
+/// Build a [`Skip`] for a span in `source`.
+fn make_skip(file: &str, source: &str, start: usize, end: usize, reason: &str) -> Skip {
+    let (line, col) = line_col(source, start);
+    Skip {
+        file: file.to_string(),
+        line,
+        col,
+        snippet: snippet(source, start, end),
+        reason: reason.to_string(),
+    }
+}
+
+impl TransformVisitor<'_> {
     fn push_skip(&mut self, start: usize, end: usize, reason: &str) {
-        let (line, col) = self.line_col(start);
-        self.skips.push(Skip {
-            file: self.file.to_string(),
-            line,
-            col,
-            snippet: self.snippet(start, end),
-            reason: reason.to_string(),
-        });
+        self.skips
+            .push(make_skip(self.file, self.source, start, end, reason));
     }
 
     fn is_consumed(&self, start: usize, end: usize) -> bool {
         self.consumed.iter().any(|(s, e)| start >= *s && end <= *e)
+    }
+
+    fn is_cast_guarded(&self, start: usize, end: usize) -> bool {
+        self.cast_guarded
+            .iter()
+            .any(|(s, e)| start == *s && end == *e)
     }
 
     /// Decide how to handle a *rewritable-shaped* time leak given the current
@@ -567,7 +708,25 @@ impl TransformVisitor<'_> {
                 }
                 let name = struct_name.clone();
                 match self.struct_defs.get(&name) {
-                    Some(def) if def.field_brace_open_end.is_some() => Some(name),
+                    Some(def) if def.field_brace_open_end.is_some() => {
+                        if def.blocking_derive {
+                            self.push_skip(
+                                start,
+                                end,
+                                "enclosing struct has a #[derive] (e.g. Debug/PartialEq/Eq/Hash/Ord/Copy/Default/Serialize) that a `time: Arc<dyn Time>` field would break — map manually",
+                            );
+                            return None;
+                        }
+                        if def.time_conflict {
+                            self.push_skip(
+                                start,
+                                end,
+                                "enclosing struct already has a `time` field of a different type — cannot inject a clock — rename the field or map manually",
+                            );
+                            return None;
+                        }
+                        Some(name)
+                    }
                     Some(_) => {
                         self.push_skip(
                             start,
@@ -609,6 +768,30 @@ impl TransformVisitor<'_> {
 /// The path segments `a::b::c` of a call target, as strings.
 fn path_segs(path: &syn::Path) -> Vec<String> {
     path.segments.iter().map(|s| s.ident.to_string()).collect()
+}
+
+/// Whether `ty` is a primitive integer type — the set for which
+/// `self.time.now_ms() as <ty>` (an `i64` cast) is always valid, so a
+/// `…as_millis() as <ty>` rewrite is type-safe.
+fn is_int_cast_ty(ty: &syn::Type) -> bool {
+    const INT_TYPES: &[&str] = &[
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+    ];
+    if let syn::Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return INT_TYPES.contains(&seg.ident.to_string().as_str());
+        }
+    }
+    false
+}
+
+/// If `expr` (unwrapping parens) is an `…as_millis()` method call, return it.
+fn as_millis_chain(expr: &syn::Expr) -> Option<&syn::ExprMethodCall> {
+    match expr {
+        syn::Expr::MethodCall(m) if m.method == "as_millis" => Some(m),
+        syn::Expr::Paren(p) => as_millis_chain(&p.expr),
+        _ => None,
+    }
 }
 
 /// Follow a `.as_millis()` receiver chain down to a root `SystemTime::now()`
@@ -699,14 +882,34 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
                     syn::Member::Unnamed(_) => false,
                 });
                 let brace_open_end = node.brace_token.span.open().byte_range().end;
+                let whole = node.span().byte_range();
                 self.literals.push(StructLiteral {
                     struct_name: name,
                     brace_open_end,
+                    lit_start: whole.start,
+                    lit_end: whole.end,
                     already_has_time,
+                    has_rest: node.rest.is_some(),
                 });
             }
         }
         visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
+        // A `SystemTime::now()…as_millis() as <int>` cast makes rewriting the
+        // millis chain to the `i64`-typed `now_ms()` type-safe. Mark the chain's
+        // span as cast-guarded BEFORE recursing so the method-call visit below
+        // sees it. Without an integer cast the rewrite would change `u128`→`i64`.
+        if is_int_cast_ty(&node.ty) {
+            if let Some(m) = as_millis_chain(&node.expr) {
+                if system_now_root(&m.receiver).is_some() {
+                    let r = m.span().byte_range();
+                    self.cast_guarded.push((r.start, r.end));
+                }
+            }
+        }
+        visit::visit_expr_cast(self, node);
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
@@ -718,7 +921,16 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
                 // Mark the inner now() call consumed so it isn't reported as a
                 // bare leak when we recurse into it.
                 self.consumed.push((nr.start, nr.end));
-                if let Some(target) = self.resolve_rewrite_target(whole.start, whole.end) {
+                if !self.is_cast_guarded(whole.start, whole.end) {
+                    // No integer `as` cast around the chain: `now_ms()` returns
+                    // i64 but `as_millis()` is u128, so a blind rewrite could
+                    // change the expression's type and fail to compile.
+                    self.push_skip(
+                        whole.start,
+                        whole.end,
+                        "SystemTime millis idiom without an integer (`as i64`/`as u64`) cast — rewriting to now_ms() would change u128→i64 — map manually",
+                    );
+                } else if let Some(target) = self.resolve_rewrite_target(whole.start, whole.end) {
                     self.rewrites.push(Rewrite {
                         struct_name: target,
                         start: whole.start,
@@ -855,6 +1067,20 @@ impl DiffOp {
 pub fn unified_diff(path: &str, old: &str, new: &str) -> String {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
+
+    // The LCS matrix is O(|a|·|b|) memory; on a very large file that blows up
+    // (e.g. a 100k-line file would allocate a ~10^10-cell matrix). Above a cap,
+    // skip the pretty line diff and emit a one-line summary instead — the actual
+    // rewrite is still applied and cargo-checked; only the human diff is elided.
+    const MAX_LCS_CELLS: usize = 4_000_000; // ~32 MB of usize cells
+    if old != new && a.len().saturating_mul(b.len()) > MAX_LCS_CELLS {
+        return format!(
+            "--- a/{path}\n+++ b/{path}\n@@ diff omitted: file too large for a line-level diff ({} → {} lines) @@\n",
+            a.len(),
+            b.len()
+        );
+    }
+
     let ops = diff_ops(&a, &b);
 
     if ops.iter().all(DiffOp::is_equal) {
@@ -1232,6 +1458,182 @@ impl Foo {
         );
         assert_eq!(r.skips.len(), 1);
         assert!(r.skips[0].reason.contains("bare SystemTime::now"));
+    }
+
+    #[test]
+    fn struct_update_base_is_skipped_not_overridden() {
+        // A `..base` literal already inherits the injected `time` from `base`;
+        // inserting `time: default` would OVERRIDE the base's clock. It must be
+        // skipped + reported, and only the plain literal gets the default.
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn bumped(&self) -> Self { Self { x: self.x + 1, ..self.clone() } }
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        let out = r
+            .changes
+            .first()
+            .map(|c| c.modified.clone())
+            .expect("Foo is migrated");
+        // Exactly ONE default insert — for `Self { x: 0 }`, NOT for the
+        // `..self.clone()` literal.
+        assert_eq!(
+            out.matches(FIELD_DEFAULT).count(),
+            1,
+            "the ..base literal must NOT get a time default:\n{out}"
+        );
+        // The struct-update literal is reported as a skip.
+        assert!(
+            r.skips.iter().any(|s| s.reason.contains("..base")),
+            "expected a `..base` skip, got: {:?}",
+            r.skips
+        );
+    }
+
+    #[test]
+    fn derive_debug_struct_is_skipped_not_broken() {
+        // Injecting `time: Arc<dyn Time>` into a struct that derives Debug/PartialEq
+        // would break the derive and fail cargo check → whole-run revert. Skip it.
+        let src = r#"
+#[derive(Debug, PartialEq)]
+struct Stamped { id: u64, at_ms: i64 }
+impl Stamped {
+    fn new(id: u64) -> Self { Self { id, at_ms: 0 } }
+    fn stamp(&self) -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty(),
+            "derive-Debug struct must not be migrated"
+        );
+        assert!(
+            r.structs_migrated.is_empty(),
+            "derive-Debug struct must not be marked migrated"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("derive"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn derive_copy_or_default_struct_is_skipped_not_broken() {
+        // `Arc<dyn Time>` is neither `Copy` nor `Default`, so injecting the field
+        // into a struct deriving either would break the derive and revert the
+        // whole run. Both must be skipped, not migrated.
+        for derive in ["Copy, Clone", "Default"] {
+            let src = format!(
+                r#"
+#[derive({derive})]
+struct S {{ n: u64 }}
+impl S {{
+    fn new() -> Self {{ Self {{ n: 0 }} }}
+    fn t(&self) -> std::time::Instant {{ Instant::now() }}
+}}
+"#
+            );
+            let r = plan(&src);
+            assert!(
+                r.changes.is_empty() && r.structs_migrated.is_empty(),
+                "#[derive({derive})] struct must be skipped, not migrated"
+            );
+            assert_eq!(r.skips.len(), 1, "derive `{derive}`");
+            assert!(
+                r.skips[0].reason.contains("derive"),
+                "derive `{derive}` reason: {}",
+                r.skips[0].reason
+            );
+        }
+    }
+
+    #[test]
+    fn systemtime_millis_without_int_cast_is_skipped() {
+        // `as_millis()` is u128; `now_ms()` is i64. Without an integer cast the
+        // rewrite would change the expression's type → skip + report.
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn now(&self) -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()
+    }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty(),
+            "u128 millis (no int cast) must not be rewritten"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("u128") || r.skips[0].reason.contains("cast"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn systemtime_millis_with_u64_cast_is_rewritten() {
+        // An integer cast (here `as u64`) makes the rewrite type-safe.
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn now(&self) -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+}
+"#;
+        let out = modified(src);
+        assert!(out.contains("self.time.now_ms() as u64"), "got:\n{out}");
+        assert!(!out.contains("SystemTime::now"), "stale call:\n{out}");
+    }
+
+    #[test]
+    fn domain_time_field_of_other_type_is_not_treated_as_migrated() {
+        // A struct with a domain `time: u64` field must NOT be treated as already
+        // migrated, and must NOT have a second `time` field injected. Skip it.
+        let src = r#"
+struct Foo { time: u64, x: u8 }
+impl Foo {
+    fn new() -> Self { Self { time: 0, x: 0 } }
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty(),
+            "must not migrate a struct whose `time` field is a different type"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("different type"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn large_file_diff_is_summarized_not_quadratic() {
+        // Above the LCS cap, unified_diff emits a summary instead of building a
+        // quadratic matrix (OOM guard).
+        let big: String = "x\n".repeat(3_000);
+        let big2 = format!("{big}y\n");
+        let d = unified_diff("big.rs", &big, &big2);
+        assert!(
+            d.contains("diff omitted"),
+            "expected a summarized diff, got: {}",
+            &d[..d.len().min(200)]
+        );
     }
 
     #[test]

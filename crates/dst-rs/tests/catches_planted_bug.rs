@@ -1,87 +1,127 @@
 //! The credibility test: a REAL, deliberately-planted bug, caught by the harness.
 //!
 //! The planted bug is a **durability ordering** defect: a ledger that *acknowledges*
-//! a deposit to the caller BEFORE the write is durable. A correct ledger persists
-//! first, then acks. The two implementations are byte-identical except for that
-//! ordering — this is the kind of bug that passes every happy-path test and only
-//! surfaces when a crash lands in the tiny window between ack and persist.
+//! a deposit to the caller BEFORE the write is confirmed durable. A correct ledger
+//! persists first, then acks. The two implementations are byte-identical except for
+//! that ordering — the kind of bug that passes every happy-path test and only
+//! surfaces when a durable-write is silently lost in the tiny window between ack and
+//! persist.
+//!
+//! Crucially, the failure here is produced and found by the harness machinery, not by
+//! a hand-coded boolean:
+//!   - the crash is a **real [`Delivery::Dropped`]** returned by a [`SimulatedNetwork`]
+//!     whose link faults come from a **seeded [`FaultSchedule`]** (a `CrashRestart`
+//!     maps to a silently-dropped persist);
+//!   - the deposit workload runs on the deterministic [`SimScheduler`], which
+//!     interleaves the ack↔persist window at a real `.await` point;
+//!   - the durability invariant is evaluated by [`InvariantEngine`];
+//!   - the failing schedule is shrunk to its minimal trigger by [`ddmin`].
 //!
 //! What this test proves, end-to-end:
 //!   (a) sweeping seeds under fault injection, the harness FINDS a failing seed for
-//!       the buggy ledger (and finds NONE for the correct one — so the harness is
-//!       discriminating, not trivially always-failing);
+//!       the buggy ledger, and finds NONE for the correct one (so it is
+//!       discriminating — it catches the BUG, not merely the presence of faults);
 //!   (b) `ddmin` shrinks the failing schedule to a MINIMAL reproducer — a single
-//!       `CrashRestart` — which is the actionable bug report.
+//!       `CrashRestart` — the actionable bug report.
 //!
 //! Determinism: a fixed seed range (0..256) and seeded schedules, so this test is
 //! reproducible, never flaky. `SEED=<n>` re-runs a single seed for manual triage.
 
-use dst_rs::{ddmin, Fault, FaultSchedule, Invariant, InvariantEngine, Violation};
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use dst_rs::{
+    ddmin, sim_yield_now, Delivery, Fault, FaultSchedule, Invariant, InvariantEngine, SimScheduler,
+    SimulatedNetwork, Violation,
+};
 
 /// State of the ledger the invariant engine inspects.
 ///
 /// * `acknowledged` — total deposits the caller was told succeeded.
 /// * `durable`      — total deposits actually persisted to durable storage.
 ///
-/// A correct system guarantees `durable == acknowledged`: nothing acknowledged is
+/// A correct system guarantees `durable >= acknowledged`: nothing acknowledged is
 /// ever lost. That is the one invariant this harness checks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct LedgerState {
     acknowledged: u64,
     durable: u64,
 }
 
-fn ledger_invariants() -> InvariantEngine<LedgerState> {
+fn durability_invariants() -> InvariantEngine<LedgerState> {
     InvariantEngine::new(vec![Invariant::new(
         "acknowledged_writes_are_durable",
-        |s: &LedgerState| s.durable == s.acknowledged,
+        |s: &LedgerState| s.durable >= s.acknowledged,
     )])
 }
 
-/// Run the ledger across `schedule`, one deposit of 1 per step. Returns the FIRST
-/// invariant violation (the step at which an acknowledged deposit was lost), or
-/// `None` if the run stayed correct.
+/// Whether a persist attempt reached durable storage. Only a crash (`Dropped`,
+/// mapped from `Fault::CrashRestart`) loses the write; a transient `Failed` is
+/// retried to success and a `Delayed` delivery still lands. This is the durable
+/// storage's semantics — the *bug* is the ledger's ack-before-persist ordering,
+/// not this mapping.
+fn persisted(outcome: Delivery<()>) -> bool {
+    !matches!(outcome, Delivery::Dropped)
+}
+
+/// Drive the ledger across a fault-injected link on the deterministic scheduler.
+/// One deposit of 1 per schedule step. Returns the FIRST invariant violation (the
+/// step at which an acknowledged deposit was lost), or `None` if the run stayed
+/// correct.
 ///
-/// `buggy == true` acks before persisting (the planted bug); `false` persists
-/// before acking (correct). Only `CrashRestart` faults interact with the ledger —
-/// they strike in the ack↔persist window; other fault kinds are quiescent here.
+/// `buggy == true` acks before confirming the persist (the planted bug); `false`
+/// persists (confirms) before acking (correct).
 fn run_ledger(schedule: &FaultSchedule, buggy: bool) -> Option<Violation> {
-    let mut acknowledged: u64 = 0;
-    let mut durable: u64 = 0;
-    let engine = ledger_invariants();
+    let net = Rc::new(SimulatedNetwork::new(schedule.clone()));
+    let state = Rc::new(RefCell::new(LedgerState::default()));
+    let found: Rc<RefCell<Option<Violation>>> = Rc::new(RefCell::new(None));
+    let steps = schedule.len();
 
-    for step in 0..schedule.len() {
-        // A deposit of 1 arrives this step; a crash may strike mid-write.
-        let crash = matches!(schedule.at(step), Fault::CrashRestart);
+    let mut sched = SimScheduler::new();
+    {
+        let net = Rc::clone(&net);
+        let state = Rc::clone(&state);
+        let found = Rc::clone(&found);
+        sched.spawn(async move {
+            let engine = durability_invariants();
+            for step in 0..steps {
+                if buggy {
+                    // BUG: acknowledge to the caller BEFORE the persist is
+                    // confirmed durable.
+                    state.borrow_mut().acknowledged += 1;
+                    // The ack↔persist window — the scheduler may interleave here.
+                    sim_yield_now().await;
+                    if persisted(net.send(())) {
+                        state.borrow_mut().durable += 1;
+                    }
+                    // A crash in this window: acknowledged but never persisted →
+                    // durable falls behind acknowledged → lost write.
+                } else {
+                    // CORRECT: persist (confirm) first, then acknowledge. A crash
+                    // before the persist confirms simply leaves the deposit
+                    // un-acknowledged (the caller retries); nothing is lost.
+                    let ok = persisted(net.send(()));
+                    sim_yield_now().await;
+                    if ok {
+                        let mut s = state.borrow_mut();
+                        s.durable += 1;
+                        s.acknowledged += 1;
+                    }
+                }
 
-        if buggy {
-            // BUG: acknowledge to the caller BEFORE the write is durable.
-            acknowledged += 1;
-            if !crash {
-                // No crash: the write reaches durable storage.
-                durable += 1;
+                let snapshot = *state.borrow();
+                if found.borrow().is_none() {
+                    if let Some(v) = engine.check(step, &snapshot) {
+                        *found.borrow_mut() = Some(v);
+                    }
+                }
             }
-            // Crash in the ack↔persist window: the acknowledged write is lost —
-            // `durable` is NOT incremented, so it falls behind `acknowledged`.
-        } else {
-            // CORRECT: persist first, then acknowledge. A crash before persist
-            // simply leaves the deposit un-acknowledged (the caller retries);
-            // nothing acknowledged is ever lost.
-            if !crash {
-                durable += 1;
-                acknowledged += 1;
-            }
-        }
-
-        let state = LedgerState {
-            acknowledged,
-            durable,
-        };
-        if let Some(v) = engine.check(step, &state) {
-            return Some(v);
-        }
+        });
     }
-    None
+    sched.run();
+
+    let v = found.borrow_mut().take();
+    v
 }
 
 /// Search a fixed seed range for a schedule that makes the buggy ledger violate
@@ -126,7 +166,8 @@ fn harness_finds_and_shrinks_the_planted_durability_bug() {
         return;
     }
 
-    // (a) The harness FINDS a failing seed for the buggy ledger.
+    // (a) The harness FINDS a failing seed for the buggy ledger — the failure comes
+    //     out of a real SimulatedNetwork Dropped delivery driven on the scheduler.
     let (seed, sched) = find_failing_seed().expect("harness should find a failing seed in 0..256");
     let violation = run_ledger(&sched, true).expect("the failing seed must reproduce");
 
@@ -138,7 +179,8 @@ fn harness_finds_and_shrinks_the_planted_durability_bug() {
     );
 
     // (b) `ddmin` shrinks the failing schedule to a MINIMAL reproducer.
-    // Input: every fault point in the schedule (crashes plus irrelevant noise).
+    // Input: every fault point in the schedule (crashes plus irrelevant noise —
+    // transient errors and clock skews that the ledger tolerates).
     let fault_points: Vec<(usize, Fault)> = sched
         .fault_steps()
         .into_iter()
@@ -146,7 +188,8 @@ fn harness_finds_and_shrinks_the_planted_durability_bug() {
         .collect();
 
     // Predicate: rebuild a full-length schedule containing ONLY this subset of
-    // faults, and check whether the buggy ledger still loses an acknowledged write.
+    // faults, drive the buggy ledger through the harness again, and check whether
+    // it still loses an acknowledged write.
     let reproduces = |subset: &[(usize, Fault)]| -> bool {
         let mut faults = vec![Fault::None; sched.len()];
         for (i, f) in subset {
@@ -182,9 +225,10 @@ fn harness_finds_and_shrinks_the_planted_durability_bug() {
     print!("{}", report(seed, &violation, &minimal));
 }
 
-/// Sanity floor: the buggy ledger loses a write on *every* schedule containing a
-/// crash, and the correct one never does — over the whole fixed seed range. This
-/// makes the "finds a failing seed" claim above non-accidental.
+/// Sanity floor: over the whole fixed seed range, the buggy ledger loses a write on
+/// *exactly* the schedules that carry a crash (a dropped persist), and the correct
+/// one never does. This makes the "finds a failing seed" claim non-accidental, and
+/// pins the harness's discrimination to the real fault, not to any noise fault.
 #[test]
 fn buggy_loses_writes_iff_a_crash_occurs_correct_never_does() {
     for seed in 0..256u64 {
@@ -193,11 +237,42 @@ fn buggy_loses_writes_iff_a_crash_occurs_correct_never_does() {
         let buggy_failed = run_ledger(&sched, true).is_some();
         assert_eq!(
             buggy_failed, has_crash,
-            "seed {seed}: buggy ledger must fail exactly when a crash occurs"
+            "seed {seed}: buggy ledger must fail exactly when a crash (dropped persist) occurs"
         );
         assert!(
             run_ledger(&sched, false).is_none(),
             "seed {seed}: the correct ledger must never lose an acknowledged write"
         );
     }
+}
+
+/// A tight, self-contained end-to-end drive of [`SimScheduler`] + [`SimulatedNetwork`]
+/// on a hand-built schedule: a single `CrashRestart` at a known step. It proves the
+/// two harness primitives cooperate to expose the ordering bug (buggy loses the
+/// write, correct does not) without any seed search — the machinery, in the small.
+#[test]
+fn scheduler_and_network_together_expose_the_ordering_bug() {
+    // A clear link except for one dropped persist at step 2.
+    let schedule = FaultSchedule::from_faults(vec![
+        Fault::None,
+        Fault::None,
+        Fault::CrashRestart, // the single crash in the ack↔persist window
+        Fault::None,
+        Fault::None,
+    ]);
+
+    // Buggy ledger: the crash lands between ack and persist → a lost write, caught
+    // by the invariant engine at the crash step.
+    let buggy = run_ledger(&schedule, true).expect("buggy ledger must lose the acked write");
+    assert_eq!(
+        buggy.step, 2,
+        "the violation must be pinpointed at the crash step"
+    );
+    assert_eq!(buggy.invariant, "acknowledged_writes_are_durable");
+
+    // Correct ledger: same schedule, same harness, no lost write.
+    assert!(
+        run_ledger(&schedule, false).is_none(),
+        "correct ledger survives the same dropped persist"
+    );
 }

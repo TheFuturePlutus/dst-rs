@@ -65,3 +65,33 @@ pub fn boot_timestamp() -> i64 {
         .unwrap()
         .as_millis() as i64
 }
+
+/// A struct that derives `Debug` and `PartialEq`. It has a rewritable-shaped
+/// TIME leak in an inherent `&self` method, but migrate must **SKIP** it: adding
+/// a `time: Arc<dyn dst_rs::Time>` field (which is neither `Debug` nor
+/// `PartialEq`) would break the derives, fail `cargo check`, and — under the
+/// all-or-nothing revert — throw away the WHOLE run's good rewrites. So the leak
+/// is reported, and this struct is left compiling exactly as written.
+#[derive(Debug, PartialEq)]
+pub struct Stamped {
+    id: u64,
+    at_ms: i64,
+}
+
+impl Stamped {
+    pub fn new(id: u64) -> Self {
+        Self { id, at_ms: 0 }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// LEAK (must be SKIPPED because the struct derives Debug/PartialEq).
+    pub fn stamp(&self) -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+}

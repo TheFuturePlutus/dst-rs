@@ -31,6 +31,21 @@ thread_local! {
     static TIMERS: RefCell<BinaryHeap<Reverse<(u64, u64, WakerBox)>>> =
         const { RefCell::new(BinaryHeap::new()) };
     static TIMER_SEQ: Cell<u64> = const { Cell::new(0) };
+    // True while a `run()` is in progress on this thread. The clock / timer heap
+    // / timer-seq above are thread-local shared state that a NESTED `run()` would
+    // silently clobber (reset to 0, drop pending timers), corrupting the outer
+    // run. `run()` is therefore non-reentrant and this flag enforces it loudly.
+    static RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII guard that marks a `run()` as in-progress and clears the flag on drop —
+/// including on unwind, so a panicking task cannot leave the thread wedged in a
+/// "running" state that poisons the next `run()`.
+struct RunGuard;
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        RUNNING.with(|r| r.set(false));
+    }
 }
 
 /// A `Waker` that is `Ord`-comparable only by the tuple around it (never by itself),
@@ -121,7 +136,26 @@ impl SimScheduler {
     /// order; when the ready queue empties, advances the virtual clock to the next due
     /// timer and wakes its sleeper. Terminates when no task is ready and no timer is
     /// pending.
+    ///
+    /// **Non-reentrant.** The virtual clock, timer heap, and timer sequence are
+    /// per-thread shared state; a `run()` invoked from within a task being driven
+    /// by an outer `run()` (on the same thread) would reset and clobber that
+    /// state. Such a nested call panics with a clear message rather than
+    /// corrupting the outer run silently. Run independent schedulers on separate
+    /// threads, or sequentially.
     pub fn run(&mut self) {
+        RUNNING.with(|r| {
+            assert!(
+                !r.get(),
+                "SimScheduler::run() is not reentrant: a nested run() on the same \
+                 thread would clobber the outer run's virtual clock and timers. \
+                 Run schedulers sequentially or on separate threads."
+            );
+            r.set(true);
+        });
+        // From here on, always clear RUNNING on exit (including panic/unwind).
+        let _running = RunGuard;
+
         CLOCK_MS.with(|c| c.set(0));
         TIMERS.with(|t| t.borrow_mut().clear());
         TIMER_SEQ.with(|s| s.set(0));
@@ -277,6 +311,47 @@ mod tests {
             "step 0 of all tasks first (FIFO round-robin)"
         );
         assert_eq!(a.len(), 9);
+    }
+
+    /// `run()` is non-reentrant: nesting one inside a task driven by an outer
+    /// `run()` would clobber the shared thread-local clock/timer state, so it must
+    /// panic loudly instead of corrupting the outer run silently.
+    #[test]
+    #[should_panic(expected = "not reentrant")]
+    fn nested_run_panics_loudly() {
+        let mut outer = SimScheduler::new();
+        outer.spawn(async {
+            let mut inner = SimScheduler::new();
+            inner.spawn(async {});
+            inner.run(); // reentrant on the same thread → must panic
+        });
+        outer.run();
+    }
+
+    /// After a panic unwinds out of `run()`, the re-entrancy flag must be cleared
+    /// so a subsequent, sequential `run()` on the same thread still works.
+    #[test]
+    fn run_is_usable_again_after_a_panicking_run() {
+        let mut s = SimScheduler::new();
+        s.spawn(async { panic!("boom") });
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.run()));
+        assert!(
+            caught.is_err(),
+            "the task panic should surface out of run()"
+        );
+
+        // A fresh, sequential run must not be poisoned by the previous unwind.
+        let done = Rc::new(Cell::new(false));
+        let d = done.clone();
+        let mut s2 = SimScheduler::new();
+        s2.spawn(async move {
+            d.set(true);
+        });
+        s2.run();
+        assert!(
+            done.get(),
+            "sequential run after a panic must still execute"
+        );
     }
 
     #[test]

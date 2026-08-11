@@ -18,6 +18,14 @@
 //! - [`Network`] — cluster-internal node-to-node communication (marker)
 //! - [`Executor`] — task spawning and `block_on`
 //!
+//! **The simulation impls are reproducible only under single-threaded drive.**
+//! [`SimulatedTime`] and [`SimulatedRandom`] fix the *content* of the clock and
+//! byte stream, but not the *order* in which concurrent OS threads consume them.
+//! Bit-for-bit replay therefore requires running the workload on the
+//! deterministic [`SimScheduler`] (one task at a time), not on the multi-threaded
+//! `tokio` runtime. [`SimulatedExecutor`] only counts spawns; it does not by
+//! itself confer determinism.
+//!
 //! ## Harness building blocks
 //!
 //! - [`SimScheduler`] — a single-threaded deterministic async scheduler

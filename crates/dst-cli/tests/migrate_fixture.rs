@@ -153,14 +153,20 @@ fn migrate_is_seam_safe_deterministic_and_idempotent() {
         out.contains("leaks rewritten  : 3"),
         "expected 3 leaks rewritten:\n{out}"
     );
-    // (5) free function reported as skipped, with a reason.
+    // (5) two leaks reported as skipped: the free function, and the leak inside
+    //     the `#[derive(Debug, PartialEq)]` struct (which must NOT be migrated).
     assert!(
-        out.contains("leaks skipped    : 1"),
-        "expected exactly 1 skip:\n{out}"
+        out.contains("leaks skipped    : 2"),
+        "expected exactly 2 skips (free fn + derive-Debug struct):\n{out}"
     );
     assert!(
         out.contains("free fn") && out.contains("SystemTime::now()"),
-        "the skip must be the free-function SystemTime leak, reported (not rewritten):\n{out}"
+        "the skip must include the free-function SystemTime leak, reported (not rewritten):\n{out}"
+    );
+    // The derive-Debug struct's leak must be reported as skipped, not rewritten.
+    assert!(
+        out.contains("derive"),
+        "expected a skip explaining the #[derive] struct was left alone:\n{out}"
     );
 
     // Verify the actual rewrites landed, and the free fn was left ALONE.
@@ -177,6 +183,27 @@ fn migrate_is_seam_safe_deterministic_and_idempotent() {
     assert!(
         boot_body.contains("SystemTime::now()"),
         "free-fn leak must NOT be rewritten:\n{boot_body}"
+    );
+
+    // The derive-Debug struct must be left completely untouched: its derives and
+    // its SystemTime leak survive verbatim, and it gains no `time` field. (That
+    // the whole crate still `cargo check`s above proves the derives weren't
+    // broken — otherwise the run would have reverted.)
+    assert!(
+        migrated.contains("#[derive(Debug, PartialEq)]"),
+        "derive-Debug struct's derives must be preserved:\n{migrated}"
+    );
+    let stamped_impl = migrated
+        .split("impl Stamped")
+        .nth(1)
+        .expect("Stamped impl present");
+    assert!(
+        stamped_impl.contains("SystemTime::now()"),
+        "derive-Debug struct's leak must NOT be rewritten:\n{stamped_impl}"
+    );
+    assert!(
+        !stamped_impl.contains("self.time"),
+        "derive-Debug struct must not be routed through self.time:\n{stamped_impl}"
     );
 
     // ── (6) Second run is a no-op / idempotent. ──

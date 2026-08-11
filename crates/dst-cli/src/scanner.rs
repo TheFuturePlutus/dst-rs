@@ -186,13 +186,26 @@ fn classify_call(segs: &[String]) -> Option<Category> {
     if prev == "rand" && last == "random" {
         return Some(Category::Random);
     }
-    if last == "thread_rng" {
+    // `thread_rng` qualified to the `rand::thread_rng` call or the bare
+    // `use rand::thread_rng; thread_rng()` idiom — so a user's own
+    // `my_utils::thread_rng()` is NOT falsely flagged.
+    if last == "thread_rng" && (n == 1 || prev == "rand") {
         return Some(Category::Random);
     }
     if first == "fastrand" {
         return Some(Category::Random);
     }
-    if prev == "Uuid" && last == "new_v4" {
+    if prev == "Uuid" && matches!(last, "new_v4" | "now_v7") {
+        return Some(Category::Random);
+    }
+    // Seeding a PRNG from OS entropy is non-deterministic:
+    // `SmallRng::from_entropy()`, `StdRng::from_entropy()`, etc.
+    if last == "from_entropy" {
+        return Some(Category::Random);
+    }
+    // `OsRng` reached in call form (e.g. `OsRng::default()`); the common
+    // method-receiver form (`OsRng.next_u64()`) is caught in the method visitor.
+    if segs.iter().any(|s| s == "OsRng") {
         return Some(Category::Random);
     }
 
@@ -293,9 +306,26 @@ impl<'ast> Visit<'ast> for LeakVisitor<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if let Some(cat) = classify_method(&node.method.to_string()) {
             self.record(cat, node.span());
+        } else if receiver_is_os_rng(&node.receiver) {
+            // `OsRng.next_u64()` / `rand::rngs::OsRng.fill_bytes(..)` — the OS
+            // entropy source used as a method receiver.
+            self.record(Category::Random, node.span());
         }
         visit::visit_expr_method_call(self, node);
     }
+}
+
+/// Whether `expr` is a path expression whose final segment is `OsRng`.
+fn receiver_is_os_rng(expr: &syn::Expr) -> bool {
+    if let syn::Expr::Path(p) = expr {
+        return p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "OsRng")
+            .unwrap_or(false);
+    }
+    false
 }
 
 /// Slice the real source text spanned by `span`, capped to a readable length.

@@ -3,6 +3,18 @@
 //! Per ADR-0022. Production impl uses `rand::thread_rng` and `Uuid::new_v4`.
 //! Simulation impl uses `ChaCha20Rng` seeded from the harness, producing
 //! deterministic sequences and deterministic UUIDs.
+//!
+//! ## Determinism requires single-threaded drive
+//!
+//! [`SimulatedRandom`] is reproducible **only when driven from a single logical
+//! thread of control** — i.e. under the [`crate::SimScheduler`], where exactly
+//! one task runs at a time. Each call is internally consistent (the counter and
+//! the RNG draw that form a UUID are taken atomically under one lock), but the
+//! *order* in which concurrent OS threads reach the RNG is not controlled here,
+//! so calling a shared `SimulatedRandom` from several `tokio` worker threads
+//! yields a run-to-run-varying interleaving. The seeded byte stream is fixed;
+//! which thread consumes which slice is not. Drive replayable workloads through
+//! the deterministic scheduler, not the multi-threaded runtime.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -103,12 +115,18 @@ impl Random for SimulatedRandom {
         // Deterministic UUID: pull 8 random bytes from the RNG, append an
         // 8-byte monotonic counter. Result is a distinct UUID per call but
         // reproducible across runs from the same seed.
+        //
+        // The counter bump and the RNG draw are taken TOGETHER under the RNG
+        // lock so the pair `(counter, rng_bytes)` is atomic. If the counter were
+        // fetched under a separate lock (or lock-free) the two could interleave
+        // under concurrent callers — thread A's counter paired with thread B's
+        // draw — tearing the pairing and producing a UUID set that never occurs
+        // single-threaded. Holding one lock for both makes the k-th lock
+        // acquisition always pair counter k with RNG draw k.
+        let mut rng = self.rng.lock().expect("SimulatedRandom mutex poisoned");
         let counter = self.uuid_counter.fetch_add(1, Ordering::Relaxed);
-        let rng_bytes = self
-            .rng
-            .lock()
-            .expect("SimulatedRandom mutex poisoned")
-            .next_u64();
+        let rng_bytes = rng.next_u64();
+        drop(rng);
 
         let mut bytes = [0u8; 16];
         bytes[0..8].copy_from_slice(&rng_bytes.to_le_bytes());
@@ -212,6 +230,56 @@ mod tests {
         r1.shuffle_u64(&mut v1);
         r2.shuffle_u64(&mut v2);
         assert_eq!(v1, v2);
+    }
+
+    /// Regression for the torn-pairing bug: the counter and the RNG draw that
+    /// compose a UUID must be taken atomically. When they are, the *set* of
+    /// UUIDs produced by N calls is fixed by the seed regardless of how many
+    /// threads race for them — the k-th lock acquisition always pairs counter k
+    /// with RNG draw k. If the two were pulled under separate locks, concurrent
+    /// callers would mint pairings (counter_i, draw_j, i≠j) that never occur
+    /// single-threaded, so the concurrent set would diverge from the canonical
+    /// single-threaded set. This test fails (flakily but reliably under load)
+    /// against the two-lock version and always passes against the fix.
+    #[test]
+    fn simulated_random_uuid_pairing_is_atomic_under_threads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const SEED: u64 = 0xDEAD_BEEF;
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 2_000;
+        const TOTAL: usize = THREADS * PER_THREAD;
+
+        // Canonical single-threaded set of the first TOTAL UUIDs from SEED.
+        let canonical: HashSet<Uuid> = {
+            let r = SimulatedRandom::from_seed(SEED);
+            (0..TOTAL).map(|_| r.next_uuid()).collect()
+        };
+        assert_eq!(canonical.len(), TOTAL, "single-threaded UUIDs are distinct");
+
+        // Repeat a few trials to make the (timing-dependent) tear near-certain
+        // if the pairing is not atomic.
+        for _ in 0..5 {
+            let shared = Arc::new(SimulatedRandom::from_seed(SEED));
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    let r = Arc::clone(&shared);
+                    thread::spawn(move || {
+                        (0..PER_THREAD).map(|_| r.next_uuid()).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let concurrent: HashSet<Uuid> = handles
+                .into_iter()
+                .flat_map(|h| h.join().expect("uuid worker panicked"))
+                .collect();
+            assert_eq!(
+                concurrent, canonical,
+                "concurrent UUID set must match the canonical single-threaded set \
+                 (atomic counter/draw pairing)"
+            );
+        }
     }
 
     #[test]

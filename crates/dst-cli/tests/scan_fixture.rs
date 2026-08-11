@@ -57,7 +57,7 @@ fn finds_exactly_the_expected_leaks() {
 
     // Exact per-category counts.
     assert_eq!(count(&leaks, "time"), 5, "TIME leaks: {leaks:#?}");
-    assert_eq!(count(&leaks, "random"), 6, "RANDOM leaks: {leaks:#?}");
+    assert_eq!(count(&leaks, "random"), 9, "RANDOM leaks: {leaks:#?}");
     assert_eq!(count(&leaks, "network"), 5, "NETWORK leaks: {leaks:#?}");
     assert_eq!(
         count(&leaks, "concurrency"),
@@ -66,7 +66,7 @@ fn finds_exactly_the_expected_leaks() {
     );
 
     // Exact total — no extra, no missing.
-    assert_eq!(leaks.len(), 18, "total leaks: {leaks:#?}");
+    assert_eq!(leaks.len(), 21, "total leaks: {leaks:#?}");
 
     // Only these four fixture files contain leaks; every category has exactly
     // one file. Nothing else may appear.
@@ -117,6 +117,15 @@ fn zero_false_positives_on_decoys() {
             .any(|l| l.snippet.contains("generate()") || l.snippet.contains("b.spawn()")),
         "flagged a decoy method call"
     );
+
+    // A user module's own `my_utils::thread_rng()` must NOT be flagged — only
+    // `rand`'s `thread_rng` is a leak (qualification, not bare name match).
+    assert!(
+        !leaks
+            .iter()
+            .any(|l| l.snippet.contains("my_utils::thread_rng")),
+        "flagged a user-defined qualified thread_rng()"
+    );
 }
 
 #[test]
@@ -137,7 +146,10 @@ fn spot_check_specific_leaks() {
     assert!(has("random", "thread_rng"), "missing thread_rng");
     assert!(has("random", "gen_range"), "missing gen_range");
     assert!(has("random", "new_v4"), "missing Uuid::new_v4");
+    assert!(has("random", "now_v7"), "missing Uuid::now_v7");
     assert!(has("random", "fastrand"), "missing fastrand");
+    assert!(has("random", "from_entropy"), "missing from_entropy");
+    assert!(has("random", "OsRng"), "missing OsRng");
     assert!(has("network", "reqwest::get"), "missing reqwest::get");
     assert!(has("network", "TcpStream"), "missing TcpStream");
     assert!(has("network", "tokio::net"), "missing tokio::net");

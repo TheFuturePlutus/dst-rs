@@ -88,6 +88,12 @@ pub struct SimulatedTime {
     /// Simulated clock value at construction (Unix ms). Used as the
     /// reference point for `instant_now`.
     start_ms: AtomicI64,
+    /// Monotonic high-water mark of elapsed ms since `start_ms`. `instant_now`
+    /// never regresses below this, so a backward wall-clock jump (negative
+    /// `ClockSkew`, or `set_to_ms` moving down) cannot make the *monotonic*
+    /// instant go backwards — matching real `Instant`, which is monotonic even
+    /// when the wall clock is corrected backwards.
+    instant_hwm_ms: AtomicI64,
     /// Sender side of the clock-broadcast channel.
     clock_tx: watch::Sender<i64>,
 }
@@ -99,16 +105,19 @@ impl SimulatedTime {
         Self {
             real_epoch: Instant::now(),
             start_ms: AtomicI64::new(start_ms),
+            instant_hwm_ms: AtomicI64::new(0),
             clock_tx: tx,
         }
     }
 
-    /// Advance the simulated clock by `delta` milliseconds.
+    /// Advance the simulated clock by `delta` milliseconds (may be negative).
     ///
     /// All sleepers whose wake time is now in the past will be woken on
     /// their next poll. This call does not wait; it returns immediately.
+    /// Uses saturating arithmetic so an extreme `delta` cannot overflow-panic
+    /// the clock in debug builds.
     pub fn advance_ms(&self, delta: i64) {
-        self.clock_tx.send_modify(|c| *c += delta);
+        self.clock_tx.send_modify(|c| *c = c.saturating_add(delta));
     }
 
     /// Set the simulated clock to an absolute Unix-millisecond value.
@@ -134,8 +143,25 @@ impl Time for SimulatedTime {
     }
 
     fn instant_now(&self) -> Instant {
-        let elapsed_ms = (self.now_ms() - self.start_ms.load(Ordering::Relaxed)).max(0);
-        self.real_epoch + Duration::from_millis(elapsed_ms as u64)
+        // Elapsed since construction, clamped at >= 0. `saturating_sub` guards
+        // against overflow when `start_ms` and `now_ms` sit at opposite i64
+        // extremes (debug-build overflow panic).
+        let raw_elapsed = self
+            .now_ms()
+            .saturating_sub(self.start_ms.load(Ordering::Relaxed))
+            .max(0);
+        // Monotonic high-water mark: never return an instant earlier than one
+        // already returned, even if the wall clock jumped backwards.
+        let prev = self
+            .instant_hwm_ms
+            .fetch_max(raw_elapsed, Ordering::Relaxed);
+        let elapsed_ms = prev.max(raw_elapsed);
+        // `checked_add` keeps an astronomically large elapsed value from
+        // overflow-panicking the `Instant` addition; fall back to the last safe
+        // point (never earlier than `real_epoch`).
+        self.real_epoch
+            .checked_add(Duration::from_millis(elapsed_ms as u64))
+            .unwrap_or(self.real_epoch)
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -222,6 +248,49 @@ mod tests {
         let i1 = t.instant_now();
         let delta = i1.duration_since(i0);
         assert_eq!(delta, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn simulated_time_instant_now_is_monotonic_under_backward_clock() {
+        let t = SimulatedTime::new(10_000);
+        let i0 = t.instant_now();
+
+        // Wall clock jumps BACKWARD (e.g. NTP correction / negative ClockSkew).
+        t.set_to_ms(5_000);
+        let i1 = t.instant_now();
+        assert!(
+            i1 >= i0,
+            "instant must not regress when clock jumps backward"
+        );
+        // Real `Instant::duration_since` saturates; assert it does not panic and
+        // yields zero across the backward step.
+        assert_eq!(i1.duration_since(i0), Duration::from_millis(0));
+
+        // A negative advance (skew) also must not regress the monotonic instant.
+        t.advance_ms(-3_000);
+        let i2 = t.instant_now();
+        assert!(i2 >= i1, "negative advance must not regress the instant");
+        let _ = i2.duration_since(i1); // must not panic
+
+        // Moving forward past the high-water mark resumes advancing.
+        t.set_to_ms(20_000); // elapsed = 10_000 > previous hwm (0)
+        let i3 = t.instant_now();
+        assert!(i3 >= i2);
+        assert_eq!(
+            i3.duration_since(i0),
+            Duration::from_millis(10_000),
+            "forward progress past the hwm is measured from the start point"
+        );
+    }
+
+    #[test]
+    fn simulated_time_advance_saturates_on_extreme_delta() {
+        // Extreme advances must not overflow-panic in debug builds.
+        let t = SimulatedTime::new(i64::MAX - 1);
+        t.advance_ms(i64::MAX); // would overflow without saturation
+        assert_eq!(t.now_ms(), i64::MAX, "advance saturates at i64::MAX");
+        // instant_now over a saturated clock must also not panic.
+        let _ = t.instant_now();
     }
 
     #[tokio::test]
