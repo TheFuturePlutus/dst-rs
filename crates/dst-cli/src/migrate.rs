@@ -546,29 +546,37 @@ fn collect_cfg_attr_derives(attr: &syn::Attribute, out: &mut Vec<String>) -> Res
     Ok(())
 }
 
-/// Whether `ty` is the injected clock shape `Arc<dyn dst_rs::Time>` — an `Arc`
-/// wrapping a trait object whose bound is the **exact** `dst_rs::Time` path.
+/// Whether `ty` is the injected clock shape `std::sync::Arc<dyn dst_rs::Time>` —
+/// an `Arc` (reached by the **exact** `std::sync::Arc` path) wrapping a trait
+/// object whose bound is the **exact** `dst_rs::Time` path.
 ///
-/// Recognition is deliberately syntactic-exact: the trait path must be
-/// `dst_rs::Time` or `::dst_rs::Time` (exactly two segments, `dst_rs` then
-/// `Time`). This is precisely what `migrate` emits (see [`FIELD_DECL`]), so its
-/// own output is recognized on re-run (idempotency), while a `time`-named field
-/// of any OTHER shape — a bare `Arc<dyn Time>`, `Arc<dyn my_crate::Time>`, or a
-/// nested `Arc<dyn foo::dst_rs::Time>` — is NOT treated as already-migrated. We
-/// do not attempt to prove a bare `Time` refers to `dst_rs::Time`: syntactic
-/// `use` tracking cannot be done soundly without a name resolver, and a false
-/// "already migrated" verdict would rewrite leaks against an uncontrolled clock.
-/// The caller records such a field as a conflict and skips the struct.
+/// Recognition is deliberately syntactic-exact on BOTH the wrapper and the
+/// trait: the wrapper path must be `std::sync::Arc` or `::std::sync::Arc`
+/// (exactly three segments), and the trait path must be `dst_rs::Time` or
+/// `::dst_rs::Time` (exactly two segments). This is precisely what `migrate`
+/// emits (see [`FIELD_DECL`]), so its own output is recognized on re-run
+/// (idempotency), while a `time`-named field of any OTHER shape — a
+/// `my_crate::Arc<dyn dst_rs::Time>`, a bare `Arc<dyn dst_rs::Time>`, a bare
+/// `Arc<dyn Time>`, `Arc<dyn my_crate::Time>`, or a nested
+/// `Arc<dyn foo::dst_rs::Time>` — is NOT treated as already-migrated. We do not
+/// attempt to prove a bare `Arc`/`Time` refers to `std::sync::Arc`/`dst_rs::Time`:
+/// syntactic `use` tracking cannot be done soundly without a name resolver, and a
+/// false "already migrated" verdict would rewrite leaks against an uncontrolled
+/// clock. The caller records such a field as a conflict and skips the struct.
 fn is_arc_dyn_time(ty: &syn::Type) -> bool {
     let syn::Type::Path(tp) = ty else {
         return false;
     };
+    // The wrapper must be EXACTLY `std::sync::Arc` / `::std::sync::Arc` (a
+    // leading `::` leaves the segment idents unchanged, so both forms match).
+    let wrapper: Vec<&syn::Ident> = tp.path.segments.iter().map(|s| &s.ident).collect();
+    if !(wrapper.len() == 3 && wrapper[0] == "std" && wrapper[1] == "sync" && wrapper[2] == "Arc") {
+        return false;
+    }
+    // The angle-bracketed args live on the last (`Arc`) segment.
     let Some(seg) = tp.path.segments.last() else {
         return false;
     };
-    if seg.ident != "Arc" {
-        return false;
-    }
     let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
         return false;
     };
@@ -1755,6 +1763,32 @@ impl Foo {
         assert!(
             r.structs_migrated.is_empty(),
             "foreign-Time struct must not be marked migrated"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("different type"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn foreign_arc_wrapper_dyn_time_is_conflict_not_migrated() {
+        // MAJOR regression: `my_crate::Arc<dyn dst_rs::Time>` is NOT our injected
+        // clock — the wrapper path is `my_crate::Arc`, not `std::sync::Arc`. The
+        // old last-segment check accepted any `*::Arc`. Even though the trait is
+        // the real `dst_rs::Time`, an unproven wrapper must read as a conflict so
+        // we never rewrite leaks against an uncontrolled `Arc` type.
+        let src = r#"
+struct Foo { time: my_crate::Arc<dyn dst_rs::Time>, x: u8 }
+impl Foo {
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty() && r.structs_migrated.is_empty(),
+            "my_crate::Arc wrapper must not read as injected"
         );
         assert_eq!(r.skips.len(), 1);
         assert!(
