@@ -157,11 +157,15 @@ impl Time for SimulatedTime {
             .fetch_max(raw_elapsed, Ordering::Relaxed);
         let elapsed_ms = prev.max(raw_elapsed);
         // `checked_add` keeps an astronomically large elapsed value from
-        // overflow-panicking the `Instant` addition; fall back to the last safe
-        // point (never earlier than `real_epoch`).
+        // overflow-panicking the `Instant` addition. On overflow we must NOT
+        // fall back to `real_epoch` — that is EARLIER than a previously returned
+        // `real_epoch + delta`, which would break monotonicity (the property
+        // this method guarantees). Instead, saturate to the maximum representable
+        // instant: a fixed ceiling that is >= every non-overflowing result, so
+        // `instant_now` stays non-decreasing even at `i64`/`Duration` extremes.
         self.real_epoch
             .checked_add(Duration::from_millis(elapsed_ms as u64))
-            .unwrap_or(self.real_epoch)
+            .unwrap_or_else(|| max_representable_instant(self.real_epoch))
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -178,6 +182,34 @@ impl Time for SimulatedTime {
             }
         }
     }
+}
+
+/// The largest `Instant` reachable from `base` by adding a `Duration` of whole
+/// milliseconds without overflowing. Found by binary search over the added
+/// milliseconds, so it is deterministic and platform-independent.
+///
+/// This is the saturation ceiling for [`SimulatedTime::instant_now`]: it is a
+/// fixed value (for a given `base`) that is `>=` every non-overflowing
+/// `base + Duration::from_millis(n)`, which keeps `instant_now` monotonic on the
+/// overflow path.
+fn max_representable_instant(base: Instant) -> Instant {
+    // If even the largest `from_millis` is representable, nothing overflows.
+    if let Some(i) = base.checked_add(Duration::from_millis(u64::MAX)) {
+        return i;
+    }
+    // Invariant: `base + lo ms` is representable, `base + hi ms` is not.
+    let mut lo: u64 = 0;
+    let mut hi: u64 = u64::MAX;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if base.checked_add(Duration::from_millis(mid)).is_some() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // `lo` is the largest representable offset; the add cannot panic.
+    base + Duration::from_millis(lo)
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -291,6 +323,49 @@ mod tests {
         assert_eq!(t.now_ms(), i64::MAX, "advance saturates at i64::MAX");
         // instant_now over a saturated clock must also not panic.
         let _ = t.instant_now();
+    }
+
+    #[test]
+    fn simulated_time_instant_now_is_monotonic_across_overflow() {
+        // Drive the elapsed value to the i64 extreme so the `checked_add` in
+        // `instant_now` can overflow. Even on the overflow path the returned
+        // instant must NOT regress below a previously returned one (the old code
+        // fell back to `real_epoch`, which is earlier — a monotonicity break).
+        let t = SimulatedTime::new(0);
+        let i0 = t.instant_now();
+        t.set_to_ms(1_000);
+        let i1 = t.instant_now();
+        assert!(i1 >= i0);
+
+        // Elapsed = i64::MAX ms → `real_epoch + Duration` may overflow.
+        t.set_to_ms(i64::MAX);
+        let i2 = t.instant_now();
+        assert!(
+            i2 >= i1,
+            "instant regressed on the overflow/extreme path (broke monotonicity)"
+        );
+        // Repeated calls on the same extreme value stay non-decreasing.
+        let i3 = t.instant_now();
+        assert!(i3 >= i2, "repeated extreme calls must not regress");
+        // `duration_since` must not panic across the extreme step.
+        let _ = i2.duration_since(i1);
+        let _ = i3.duration_since(i2);
+    }
+
+    #[test]
+    fn max_representable_instant_saturates_without_panic() {
+        // The overflow-path helper must never return an instant below `base`,
+        // must be deterministic, and must not panic — even when the real
+        // `Instant` addition would overflow.
+        let base = Instant::now();
+        let a = max_representable_instant(base);
+        let b = max_representable_instant(base);
+        assert!(a >= base, "ceiling must not be earlier than base");
+        assert_eq!(a, b, "ceiling must be deterministic for a given base");
+        // Adding one more millisecond than the ceiling represents must overflow,
+        // OR the platform can represent the whole `u64::MAX` ms range (in which
+        // case `a` already equals that maximum). Either way, `a` is a valid
+        // upper bound and no panic occurred reaching it.
     }
 
     #[tokio::test]

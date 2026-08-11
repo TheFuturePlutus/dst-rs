@@ -57,7 +57,10 @@ fn finds_exactly_the_expected_leaks() {
 
     // Exact per-category counts.
     assert_eq!(count(&leaks, "time"), 5, "TIME leaks: {leaks:#?}");
-    assert_eq!(count(&leaks, "random"), 9, "RANDOM leaks: {leaks:#?}");
+    // 10 RANDOM: rand::random, thread_rng, gen_range, gen, fastrand, Uuid::new_v4,
+    // Uuid::now_v7, SmallRng::from_entropy, OsRng (receiver form), OsRng (bound to
+    // a local — value/path-expression form).
+    assert_eq!(count(&leaks, "random"), 10, "RANDOM leaks: {leaks:#?}");
     assert_eq!(count(&leaks, "network"), 5, "NETWORK leaks: {leaks:#?}");
     assert_eq!(
         count(&leaks, "concurrency"),
@@ -66,7 +69,7 @@ fn finds_exactly_the_expected_leaks() {
     );
 
     // Exact total — no extra, no missing.
-    assert_eq!(leaks.len(), 21, "total leaks: {leaks:#?}");
+    assert_eq!(leaks.len(), 22, "total leaks: {leaks:#?}");
 
     // Only these four fixture files contain leaks; every category has exactly
     // one file. Nothing else may appear.

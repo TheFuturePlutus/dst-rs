@@ -26,10 +26,16 @@ use walkdir::WalkDir;
 
 /// The kind of non-determinism a leak introduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum Category {
     Time,
     Random,
+    /// Lower-confidence randomness: a call shaped like a known RNG idiom
+    /// (e.g. `*::from_entropy()`) but on an UNRECOGNIZED receiver, where we
+    /// cannot prove it is an RNG. Reported so a human can confirm, but kept
+    /// out of the hard `Random` set to avoid false positives (e.g. a user's
+    /// `Config::from_entropy()`).
+    PossibleRandom,
     Network,
     Concurrency,
 }
@@ -39,6 +45,7 @@ impl Category {
         match self {
             Category::Time => "TIME",
             Category::Random => "RANDOM",
+            Category::PossibleRandom => "POSSIBLE-RANDOM",
             Category::Network => "NETWORK",
             Category::Concurrency => "CONCURRENCY",
         }
@@ -199,12 +206,20 @@ fn classify_call(segs: &[String]) -> Option<Category> {
         return Some(Category::Random);
     }
     // Seeding a PRNG from OS entropy is non-deterministic:
-    // `SmallRng::from_entropy()`, `StdRng::from_entropy()`, etc.
+    // `SmallRng::from_entropy()`, `StdRng::from_entropy()`, etc. Only a
+    // recognizable RNG receiver is a HARD leak; an unknown `Foo::from_entropy()`
+    // (e.g. a user `Config::from_entropy()`) is emitted lower-confidence so it is
+    // not a false positive.
     if last == "from_entropy" {
-        return Some(Category::Random);
+        return Some(if is_rng_receiver(prev) {
+            Category::Random
+        } else {
+            Category::PossibleRandom
+        });
     }
-    // `OsRng` reached in call form (e.g. `OsRng::default()`); the common
-    // method-receiver form (`OsRng.next_u64()`) is caught in the method visitor.
+    // `OsRng` reached in call form (e.g. `OsRng::default()`); the bare-value and
+    // method-receiver forms (`let r = OsRng;`, `OsRng.next_u64()`) are caught by
+    // the path/method visitors.
     if segs.iter().any(|s| s == "OsRng") {
         return Some(Category::Random);
     }
@@ -243,6 +258,15 @@ fn classify_method(method: &str) -> Option<Category> {
         "gen" | "gen_range" => Some(Category::Random),
         _ => None,
     }
+}
+
+/// Whether `seg` (the path segment immediately before `from_entropy`) names a
+/// recognizable RNG type, so `<seg>::from_entropy()` is a hard RANDOM leak. The
+/// `Rng` suffix covers the `rand` family (`SmallRng`, `StdRng`, `ChaCha20Rng`,
+/// `OsRng`, …); a short allow-list covers common non-suffixed generators.
+fn is_rng_receiver(seg: &str) -> bool {
+    const KNOWN_RNGS: &[&str] = &["Pcg32", "Pcg64", "Lcg64Xsh32", "Xoshiro256PlusPlus"];
+    seg.ends_with("Rng") || KNOWN_RNGS.contains(&seg)
 }
 
 // ── AST visitor ────────────────────────────────────────────────────────────
@@ -306,26 +330,30 @@ impl<'ast> Visit<'ast> for LeakVisitor<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if let Some(cat) = classify_method(&node.method.to_string()) {
             self.record(cat, node.span());
-        } else if receiver_is_os_rng(&node.receiver) {
-            // `OsRng.next_u64()` / `rand::rngs::OsRng.fill_bytes(..)` — the OS
-            // entropy source used as a method receiver.
-            self.record(Category::Random, node.span());
         }
+        // NOTE: `OsRng` as a method receiver (`OsRng.next_u64()`) is caught by
+        // `visit_expr_path` below when we recurse into the receiver — no special
+        // case needed here.
         visit::visit_expr_method_call(self, node);
     }
-}
 
-/// Whether `expr` is a path expression whose final segment is `OsRng`.
-fn receiver_is_os_rng(expr: &syn::Expr) -> bool {
-    if let syn::Expr::Path(p) = expr {
-        return p
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        // `OsRng` used as a bare VALUE/path expression — the OS entropy source
+        // bound to a local (`let mut rng = OsRng;`), used as a receiver
+        // (`OsRng.next_u64()`), or passed by value. A call-form assoc access like
+        // `OsRng::default` ends in `default`, so it is NOT matched here (it is
+        // handled by `classify_call`), avoiding a double count.
+        if node
             .path
             .segments
             .last()
             .map(|s| s.ident == "OsRng")
-            .unwrap_or(false);
+            .unwrap_or(false)
+        {
+            self.record(Category::Random, node.span());
+        }
+        visit::visit_expr_path(self, node);
     }
-    false
 }
 
 /// Slice the real source text spanned by `span`, capped to a readable length.
@@ -352,5 +380,69 @@ fn snippet_from_span(lines: &[Vec<char>], span: proc_macro2::Span) -> String {
         format!("{short}…")
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(src: &str) -> Vec<Leak> {
+        let mut report = ScanReport::default();
+        scan_source("t.rs", src, &mut report);
+        report.leaks
+    }
+
+    #[test]
+    fn os_rng_bound_to_a_local_is_flagged() {
+        // `let mut rng = OsRng; rng.fill_bytes(..)` — OsRng appears as a bare
+        // value/path expression, not as a method receiver. It must still be
+        // flagged (regression: the receiver-only check missed this).
+        let leaks =
+            scan("fn f() { let mut rng = OsRng; let mut b = [0u8; 8]; rng.fill_bytes(&mut b); }");
+        let os: Vec<_> = leaks
+            .iter()
+            .filter(|l| l.category == Category::Random && l.snippet.contains("OsRng"))
+            .collect();
+        assert_eq!(os.len(), 1, "expected exactly one OsRng leak: {leaks:#?}");
+    }
+
+    #[test]
+    fn os_rng_as_method_receiver_is_flagged_exactly_once() {
+        // The classic receiver form must still be flagged, and not double-counted
+        // now that detection lives in the path visitor.
+        let leaks = scan("fn f() -> u64 { rand::rngs::OsRng.next_u64() }");
+        let os: Vec<_> = leaks
+            .iter()
+            .filter(|l| l.category == Category::Random && l.snippet.contains("OsRng"))
+            .collect();
+        assert_eq!(os.len(), 1, "expected exactly one OsRng leak: {leaks:#?}");
+    }
+
+    #[test]
+    fn from_entropy_on_known_rng_is_hard_random() {
+        // `SmallRng::from_entropy()` — a recognized RNG receiver → hard RANDOM.
+        let leaks = scan("fn f() { let _ = rand::rngs::SmallRng::from_entropy(); }");
+        assert!(
+            leaks
+                .iter()
+                .any(|l| l.category == Category::Random && l.snippet.contains("from_entropy")),
+            "SmallRng::from_entropy must be RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn from_entropy_on_unknown_receiver_is_possible_random_not_random() {
+        // `Config::from_entropy()` is NOT a known RNG; it must not be a hard
+        // RANDOM false positive — it is reported lower-confidence instead.
+        let leaks = scan("fn f() { let _ = Config::from_entropy(); }");
+        assert!(
+            !leaks.iter().any(|l| l.category == Category::Random),
+            "Config::from_entropy must not be hard RANDOM: {leaks:#?}"
+        );
+        assert!(
+            leaks.iter().any(|l| l.category == Category::PossibleRandom),
+            "Config::from_entropy should be POSSIBLE-RANDOM: {leaks:#?}"
+        );
     }
 }

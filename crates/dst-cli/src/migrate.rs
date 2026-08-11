@@ -173,6 +173,7 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
     for p in &parsed {
         let mut c = StructCollector {
             file: &p.display,
+            dst_rs_time_in_scope: file_imports_dst_rs_time(&p.ast),
             defs: &mut struct_defs,
         };
         c.visit_file(&p.ast);
@@ -196,6 +197,7 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
             closure_depth: 0,
             consumed: Vec::new(),
             cast_guarded: Vec::new(),
+            unsafe_cast_guarded: Vec::new(),
             rewrites: Vec::new(),
             literals: Vec::new(),
             skips: Vec::new(),
@@ -444,6 +446,9 @@ struct StructDef {
 
 struct StructCollector<'a> {
     file: &'a str,
+    /// Whether `dst_rs::Time` is imported into bare-name scope in this file — so
+    /// a `time: Arc<dyn Time>` field can be proven to be our trait.
+    dst_rs_time_in_scope: bool,
     defs: &'a mut BTreeMap<String, StructDef>,
 }
 
@@ -470,26 +475,91 @@ const DERIVE_BLOCKERS: &[&str] = &[
     "Deserialize",
 ];
 
-/// Collect the trait idents inside every `#[derive(...)]` on `attrs`.
-fn derive_idents(attrs: &[syn::Attribute]) -> Vec<String> {
-    let mut out = Vec::new();
+/// Whether `attrs` carry a `#[derive(...)]` (plain or via `#[cfg_attr(...)]`)
+/// that a `time: Arc<dyn dst_rs::Time>` field would break (see
+/// [`DERIVE_BLOCKERS`]).
+///
+/// Two subtleties this handles that a naive single-ident scan misses:
+///   * **Qualified derives** — `#[derive(serde::Serialize)]` derives `Serialize`
+///     via its LAST path segment, not a bare ident.
+///   * **`cfg_attr` derives** — `#[cfg_attr(feature = "x", derive(PartialEq))]`
+///     only fires under a feature, but would still break the build there. Its
+///     nested `derive(...)` blockers are inspected too; if a `cfg_attr` carries a
+///     `derive` we cannot fully parse, we conservatively treat it as blocking.
+fn has_blocking_derive(attrs: &[syn::Attribute]) -> bool {
+    let mut derives = Vec::new();
+    let opaque = collect_derives(attrs, &mut derives);
+    opaque
+        || derives
+            .iter()
+            .any(|d| DERIVE_BLOCKERS.contains(&d.as_str()))
+}
+
+/// Push the last-segment ident of every derived trait in `attrs` into `out`
+/// (so `serde::Serialize` → `Serialize`). Returns `true` if a `cfg_attr`
+/// carried a `derive(...)` we could not fully parse — in which case the caller
+/// must treat the struct as blocked (fail-safe).
+fn collect_derives(attrs: &[syn::Attribute], out: &mut Vec<String>) -> bool {
+    let mut opaque = false;
     for attr in attrs {
         if attr.path().is_ident("derive") {
             let _ = attr.parse_nested_meta(|meta| {
-                if let Some(id) = meta.path.get_ident() {
-                    out.push(id.to_string());
+                if let Some(seg) = meta.path.segments.last() {
+                    out.push(seg.ident.to_string());
                 }
                 Ok(())
             });
+        } else if attr.path().is_ident("cfg_attr") && collect_cfg_attr_derives(attr, out).is_err() {
+            opaque = true;
         }
     }
-    out
+    opaque
 }
 
-/// Whether `ty` is the injected clock shape `Arc<dyn ...Time>` (any path to a
-/// trait object whose final bound is a `Time` trait). Used so a domain field
-/// `time: u64` is NOT mistaken for an already-migrated struct.
-fn is_arc_dyn_time(ty: &syn::Type) -> bool {
+/// Parse a `#[cfg_attr(pred, attr, …)]` and push any nested `derive(...)`
+/// trait idents into `out`. `Err(())` means the attribute (or a nested derive)
+/// could not be parsed — the caller treats that as a blocker (fail-safe).
+fn collect_cfg_attr_derives(attr: &syn::Attribute, out: &mut Vec<String>) -> Result<(), ()> {
+    use syn::punctuated::Punctuated;
+    use syn::{Meta, Token};
+
+    let metas: Punctuated<Meta, Token![,]> = attr
+        .parse_args_with(Punctuated::parse_terminated)
+        .map_err(|_| ())?;
+    // First element is the cfg predicate; the rest are conditional attributes.
+    for meta in metas.iter().skip(1) {
+        if !meta.path().is_ident("derive") {
+            continue;
+        }
+        match meta {
+            Meta::List(list) => {
+                let paths: Punctuated<syn::Path, Token![,]> = list
+                    .parse_args_with(Punctuated::parse_terminated)
+                    .map_err(|_| ())?;
+                for p in paths {
+                    if let Some(seg) = p.segments.last() {
+                        out.push(seg.ident.to_string());
+                    }
+                }
+            }
+            // `derive` used without a parenthesized list is malformed/unexpected
+            // — be conservative and treat it as unparseable.
+            _ => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+/// Whether `ty` is the injected clock shape `Arc<dyn dst_rs::Time>` — an `Arc`
+/// wrapping a trait object whose bound is **provably** the `dst_rs::Time` trait.
+///
+/// "Provably" means the trait path is `dst_rs::Time` / `dst_rs :: Time`, or a
+/// bare `Time` *only* when `dst_rs::Time` is imported in the file
+/// (`dst_rs_time_in_scope`). A `time`-named field of some OTHER `Arc<dyn …Time>`
+/// (e.g. `Arc<dyn my_crate::Time>`) is NOT treated as already-migrated — the
+/// caller records it as a conflict and skips the struct, so we never rewrite
+/// leaks against the wrong trait (silently preserving an uncontrolled clock).
+fn is_arc_dyn_time(ty: &syn::Type, dst_rs_time_in_scope: bool) -> bool {
     let syn::Type::Path(tp) = ty else {
         return false;
     };
@@ -506,13 +576,21 @@ fn is_arc_dyn_time(ty: &syn::Type) -> bool {
         if let syn::GenericArgument::Type(syn::Type::TraitObject(to)) = a {
             for b in &to.bounds {
                 if let syn::TypeParamBound::Trait(tb) = b {
-                    if tb
-                        .path
-                        .segments
-                        .last()
-                        .map(|s| s.ident == "Time")
-                        .unwrap_or(false)
-                    {
+                    let segs: Vec<&syn::Ident> =
+                        tb.path.segments.iter().map(|s| &s.ident).collect();
+                    let n = segs.len();
+                    if n == 0 || segs[n - 1] != "Time" {
+                        continue;
+                    }
+                    // `dst_rs::Time` (or any path whose penultimate segment is
+                    // `dst_rs`) is provably our trait.
+                    if n >= 2 && segs[n - 2] == "dst_rs" {
+                        return true;
+                    }
+                    // A bare `Time` is our trait only if it was imported from
+                    // dst_rs in this file. Any other unqualified/foreign `Time`
+                    // is UNPROVEN — do not treat it as already-migrated.
+                    if n == 1 && dst_rs_time_in_scope {
                         return true;
                     }
                 }
@@ -522,12 +600,49 @@ fn is_arc_dyn_time(ty: &syn::Type) -> bool {
     false
 }
 
+/// Whether the file imports `dst_rs::Time` into bare-name scope (so a field
+/// typed `Arc<dyn Time>` can be proven to be `dst_rs::Time`). Recurses into
+/// inline modules. `use dst_rs::Time`, `use dst_rs::{Time, …}`, and
+/// `use dst_rs::*` all count; `use dst_rs::Time as X` does NOT (the bare name
+/// `Time` is not brought into scope).
+fn file_imports_dst_rs_time(ast: &syn::File) -> bool {
+    items_import_dst_rs_time(&ast.items)
+}
+
+fn items_import_dst_rs_time(items: &[syn::Item]) -> bool {
+    items.iter().any(|it| match it {
+        syn::Item::Use(u) => use_tree_imports_dst_rs_time(&u.tree),
+        syn::Item::Mod(m) => m
+            .content
+            .as_ref()
+            .map(|(_, items)| items_import_dst_rs_time(items))
+            .unwrap_or(false),
+        _ => false,
+    })
+}
+
+fn use_tree_imports_dst_rs_time(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(p) if p.ident == "dst_rs" => use_subtree_names_time(&p.tree),
+        _ => false,
+    }
+}
+
+fn use_subtree_names_time(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Name(n) => n.ident == "Time",
+        syn::UseTree::Glob(_) => true, // `dst_rs::*` brings `Time` into scope
+        syn::UseTree::Group(g) => g.items.iter().any(use_subtree_names_time),
+        // `dst_rs::time::Time` (a deeper module path) or `Time as X` (rename):
+        // conservatively NOT counted as a provable bare-`Time` import.
+        syn::UseTree::Path(_) | syn::UseTree::Rename(_) => false,
+    }
+}
+
 impl<'ast> Visit<'ast> for StructCollector<'_> {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
         let name = node.ident.to_string();
-        let blocking_derive = derive_idents(&node.attrs)
-            .iter()
-            .any(|d| DERIVE_BLOCKERS.contains(&d.as_str()));
+        let blocking_derive = has_blocking_derive(&node.attrs);
         let (brace_open_end, has_time, time_conflict) = match &node.fields {
             syn::Fields::Named(named) => {
                 let open_end = named.brace_token.span.open().byte_range().end;
@@ -535,7 +650,7 @@ impl<'ast> Visit<'ast> for StructCollector<'_> {
                 let mut conflict = false;
                 for f in &named.named {
                     if f.ident.as_ref().map(|i| i == "time").unwrap_or(false) {
-                        if is_arc_dyn_time(&f.ty) {
+                        if is_arc_dyn_time(&f.ty, self.dst_rs_time_in_scope) {
                             injected = true;
                         } else {
                             conflict = true;
@@ -614,10 +729,14 @@ struct TransformVisitor<'a> {
     /// match, so the inner `SystemTime::now()` call is not double-reported.
     consumed: Vec<(usize, usize)>,
     /// Byte ranges of `SystemTime::now()…as_millis()` chains that sit directly
-    /// under an integer `as` cast, so rewriting them to the `i64`-typed
-    /// `now_ms()` is type-safe. Populated in `visit_expr_cast` before the inner
-    /// method call is visited.
+    /// under a SIGNED, `i64`-holding `as` cast (`as i64`/`as i128`), so rewriting
+    /// them to the `i64`-typed `now_ms()` is type-safe. Populated in
+    /// `visit_expr_cast` before the inner method call is visited.
     cast_guarded: Vec<(usize, usize)>,
+    /// Like `cast_guarded`, but for chains under an UNSIGNED/narrowing integer
+    /// cast (`as u64`/`as usize`/…). These are NOT rewritten — a negative
+    /// (pre-epoch) `now_ms()` would wrap — but they get a precise skip reason.
+    unsafe_cast_guarded: Vec<(usize, usize)>,
     rewrites: Vec<Rewrite>,
     literals: Vec<StructLiteral>,
     skips: Vec<Skip>,
@@ -685,6 +804,12 @@ impl TransformVisitor<'_> {
             .any(|(s, e)| start == *s && end == *e)
     }
 
+    fn is_unsafe_cast_guarded(&self, start: usize, end: usize) -> bool {
+        self.unsafe_cast_guarded
+            .iter()
+            .any(|(s, e)| start == *s && end == *e)
+    }
+
     /// Decide how to handle a *rewritable-shaped* time leak given the current
     /// lexical context. Returns the migrated struct name if it should be
     /// rewritten, else records a skip and returns None.
@@ -721,7 +846,7 @@ impl TransformVisitor<'_> {
                             self.push_skip(
                                 start,
                                 end,
-                                "enclosing struct already has a `time` field of a different type — cannot inject a clock — rename the field or map manually",
+                                "enclosing struct already has a `time` field of a different type (not provably `dst_rs::Time`) — cannot inject a clock — rename the field or map manually",
                             );
                             return None;
                         }
@@ -770,19 +895,41 @@ fn path_segs(path: &syn::Path) -> Vec<String> {
     path.segments.iter().map(|s| s.ident.to_string()).collect()
 }
 
-/// Whether `ty` is a primitive integer type — the set for which
-/// `self.time.now_ms() as <ty>` (an `i64` cast) is always valid, so a
-/// `…as_millis() as <ty>` rewrite is type-safe.
+/// The last-segment ident of a path type (`std::os::raw::c_int` → `c_int`).
+fn path_ty_ident(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(tp) = ty {
+        if let Some(seg) = tp.path.segments.last() {
+            return Some(seg.ident.to_string());
+        }
+    }
+    None
+}
+
+/// Whether `ty` is a primitive integer type (any signedness/width). Used only
+/// to distinguish "there IS an integer cast" from a non-int cast, so an unsafe
+/// unsigned cast gets a precise skip reason rather than the generic u128 one.
 fn is_int_cast_ty(ty: &syn::Type) -> bool {
     const INT_TYPES: &[&str] = &[
         "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
     ];
-    if let syn::Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            return INT_TYPES.contains(&seg.ident.to_string().as_str());
-        }
-    }
-    false
+    path_ty_ident(ty)
+        .map(|id| INT_TYPES.contains(&id.as_str()))
+        .unwrap_or(false)
+}
+
+/// Whether `self.time.now_ms() as <ty>` preserves the semantics of the original
+/// `…as_millis() as <ty>`. `now_ms()` returns **`i64`**, and a simulated clock
+/// can legitimately return a NEGATIVE (pre-epoch) value — where the original
+/// `duration_since(UNIX_EPOCH).unwrap()` would have *panicked*. Casting a
+/// negative `i64` to an unsigned target (`u64`/`u128`/`usize`) silently wraps to
+/// a huge value instead. So the only cast targets we rewrite are SIGNED types
+/// wide enough to hold all of `i64`: `i64` and `i128`. Everything else (unsigned
+/// or narrower) is skipped and reported.
+fn is_safe_now_ms_cast_ty(ty: &syn::Type) -> bool {
+    const SAFE_TYPES: &[&str] = &["i64", "i128"];
+    path_ty_ident(ty)
+        .map(|id| SAFE_TYPES.contains(&id.as_str()))
+        .unwrap_or(false)
 }
 
 /// If `expr` (unwrapping parens) is an `…as_millis()` method call, return it.
@@ -897,15 +1044,19 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
     }
 
     fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
-        // A `SystemTime::now()…as_millis() as <int>` cast makes rewriting the
-        // millis chain to the `i64`-typed `now_ms()` type-safe. Mark the chain's
-        // span as cast-guarded BEFORE recursing so the method-call visit below
-        // sees it. Without an integer cast the rewrite would change `u128`→`i64`.
-        if is_int_cast_ty(&node.ty) {
-            if let Some(m) = as_millis_chain(&node.expr) {
-                if system_now_root(&m.receiver).is_some() {
-                    let r = m.span().byte_range();
+        // A `SystemTime::now()…as_millis() as <int>` cast is only type- AND
+        // semantics-safe to rewrite when the target is a SIGNED type that holds
+        // all of `i64` (`as i64`/`as i128`) — `now_ms()` is i64 and may be
+        // negative pre-epoch. An unsigned/narrowing integer cast is recorded
+        // separately so the method-call visit can emit a precise skip. Mark the
+        // chain's span BEFORE recursing so the inner method-call visit sees it.
+        if let Some(m) = as_millis_chain(&node.expr) {
+            if system_now_root(&m.receiver).is_some() {
+                let r = m.span().byte_range();
+                if is_safe_now_ms_cast_ty(&node.ty) {
                     self.cast_guarded.push((r.start, r.end));
+                } else if is_int_cast_ty(&node.ty) {
+                    self.unsafe_cast_guarded.push((r.start, r.end));
                 }
             }
         }
@@ -922,14 +1073,19 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
                 // bare leak when we recurse into it.
                 self.consumed.push((nr.start, nr.end));
                 if !self.is_cast_guarded(whole.start, whole.end) {
-                    // No integer `as` cast around the chain: `now_ms()` returns
-                    // i64 but `as_millis()` is u128, so a blind rewrite could
-                    // change the expression's type and fail to compile.
-                    self.push_skip(
-                        whole.start,
-                        whole.end,
-                        "SystemTime millis idiom without an integer (`as i64`/`as u64`) cast — rewriting to now_ms() would change u128→i64 — map manually",
-                    );
+                    let reason = if self.is_unsafe_cast_guarded(whole.start, whole.end) {
+                        // There IS an integer cast, but it is unsigned/narrowing:
+                        // `now_ms()` is i64 and may be negative pre-epoch, which
+                        // would silently WRAP under `as u64` (vs the original
+                        // `.unwrap()` which panics). Refuse to rewrite.
+                        "SystemTime millis idiom under an unsigned/narrowing integer cast (e.g. `as u64`) — now_ms() is i64 and a pre-epoch value would wrap, unlike the original `.unwrap()` — map manually"
+                    } else {
+                        // No integer `as` cast around the chain: `now_ms()` returns
+                        // i64 but `as_millis()` is u128, so a blind rewrite could
+                        // change the expression's type and fail to compile.
+                        "SystemTime millis idiom without a signed integer (`as i64`) cast — rewriting to now_ms() would change u128→i64 — map manually"
+                    };
+                    self.push_skip(whole.start, whole.end, reason);
                 } else if let Some(target) = self.resolve_rewrite_target(whole.start, whole.end) {
                     self.rewrites.push(Rewrite {
                         struct_name: target,
@@ -1582,8 +1738,10 @@ impl Foo {
     }
 
     #[test]
-    fn systemtime_millis_with_u64_cast_is_rewritten() {
-        // An integer cast (here `as u64`) makes the rewrite type-safe.
+    fn systemtime_millis_with_u64_cast_is_skipped_not_rewritten() {
+        // `now_ms()` is i64 and can be negative pre-epoch; casting that to an
+        // unsigned `u64` would silently WRAP (the original `.unwrap()` panics).
+        // So an `as u64` cast must be SKIPPED + reported, not rewritten.
         let src = r#"
 struct Foo { x: u8 }
 impl Foo {
@@ -1593,9 +1751,152 @@ impl Foo {
     }
 }
 "#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty(),
+            "unsigned `as u64` cast must not be rewritten"
+        );
+        assert!(r.structs_migrated.is_empty());
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("unsigned"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn systemtime_millis_with_i64_cast_is_rewritten() {
+        // A signed `i64` cast holds all of `now_ms()`'s range → safe to rewrite.
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn now(&self) -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+    }
+}
+"#;
         let out = modified(src);
-        assert!(out.contains("self.time.now_ms() as u64"), "got:\n{out}");
+        assert!(out.contains("self.time.now_ms() as i64"), "got:\n{out}");
         assert!(!out.contains("SystemTime::now"), "stale call:\n{out}");
+    }
+
+    #[test]
+    fn foreign_dyn_time_field_is_conflict_not_migrated() {
+        // A `time` field typed `Arc<dyn other::Time>` is NOT our injected clock;
+        // rewriting leaks to `self.time.now_ms()` would target the WRONG trait
+        // and silently preserve an uncontrolled clock. Must be skipped + reported.
+        let src = r#"
+struct Foo { time: std::sync::Arc<dyn other::Time>, x: u8 }
+impl Foo {
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty(),
+            "must not rewrite against a foreign Time trait"
+        );
+        assert!(
+            r.structs_migrated.is_empty(),
+            "foreign-Time struct must not be marked migrated"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("different type"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn bare_time_field_is_migrated_only_when_imported_from_dst_rs() {
+        // With `use dst_rs::Time;` in scope, a bare `Arc<dyn Time>` IS provably
+        // our injected clock → already-migrated → idempotent no-op.
+        let imported = r#"
+use dst_rs::Time;
+struct Foo { time: std::sync::Arc<dyn Time>, x: u8 }
+impl Foo {
+    fn new() -> Self { Self { time: std::sync::Arc::new(dst_rs::ProductionTime::default()), x: 0 } }
+    fn now(&self) -> i64 { self.time.now_ms() }
+}
+"#;
+        let r = plan(imported);
+        assert!(
+            r.no_op,
+            "imported bare `Time` must read as already-migrated"
+        );
+        assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
+
+        // WITHOUT the import, a bare `Arc<dyn Time>` is UNPROVEN → treated as a
+        // conflict, not silently accepted as our clock.
+        let unimported = r#"
+struct Foo { time: std::sync::Arc<dyn Time>, x: u8 }
+impl Foo {
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r2 = plan(unimported);
+        assert!(r2.changes.is_empty() && r2.structs_migrated.is_empty());
+        assert_eq!(r2.skips.len(), 1);
+        assert!(
+            r2.skips[0].reason.contains("different type"),
+            "reason: {}",
+            r2.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn qualified_derive_serialize_is_skipped() {
+        // `#[derive(serde::Serialize)]` derives `Serialize` via the LAST path
+        // segment; a single-ident scan would miss it, inject the field, and break
+        // the derive → whole-run revert. Must be detected and skipped.
+        let src = r#"
+#[derive(serde::Serialize)]
+struct S { n: u64 }
+impl S {
+    fn new() -> Self { Self { n: 0 } }
+    fn t(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty() && r.structs_migrated.is_empty(),
+            "qualified serde::Serialize derive must be skipped"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("derive"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn cfg_attr_derive_is_skipped() {
+        // `#[cfg_attr(feature = "x", derive(PartialEq))]` derives PartialEq under
+        // a feature. Injecting the field would break the build there. The nested
+        // derive must be inspected and the struct skipped.
+        let src = r#"
+#[cfg_attr(feature = "x", derive(PartialEq))]
+struct S { n: u64 }
+impl S {
+    fn new() -> Self { Self { n: 0 } }
+    fn t(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty() && r.structs_migrated.is_empty(),
+            "cfg_attr(derive(PartialEq)) struct must be skipped"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("derive"),
+            "reason: {}",
+            r.skips[0].reason
+        );
     }
 
     #[test]

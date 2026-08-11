@@ -43,6 +43,15 @@ pub fn os_entropy() -> u64 {
     rand::rngs::OsRng.next_u64()
 }
 
+pub fn os_entropy_local() -> u64 {
+    // LEAK: OsRng bound to a local, then used — the value/path-expression form
+    // (`OsRng` is not the method receiver here; `rng` is).
+    let mut rng = rand::rngs::OsRng;
+    let mut buf = [0u8; 8];
+    rng.fill_bytes(&mut buf);
+    u64::from_le_bytes(buf)
+}
+
 // ── Decoys: must NOT be flagged ──
 
 pub struct Generator;
