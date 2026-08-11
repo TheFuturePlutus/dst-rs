@@ -173,7 +173,6 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
     for p in &parsed {
         let mut c = StructCollector {
             file: &p.display,
-            dst_rs_time_in_scope: file_imports_dst_rs_time(&p.ast),
             defs: &mut struct_defs,
         };
         c.visit_file(&p.ast);
@@ -446,9 +445,6 @@ struct StructDef {
 
 struct StructCollector<'a> {
     file: &'a str,
-    /// Whether `dst_rs::Time` is imported into bare-name scope in this file — so
-    /// a `time: Arc<dyn Time>` field can be proven to be our trait.
-    dst_rs_time_in_scope: bool,
     defs: &'a mut BTreeMap<String, StructDef>,
 }
 
@@ -551,15 +547,19 @@ fn collect_cfg_attr_derives(attr: &syn::Attribute, out: &mut Vec<String>) -> Res
 }
 
 /// Whether `ty` is the injected clock shape `Arc<dyn dst_rs::Time>` — an `Arc`
-/// wrapping a trait object whose bound is **provably** the `dst_rs::Time` trait.
+/// wrapping a trait object whose bound is the **exact** `dst_rs::Time` path.
 ///
-/// "Provably" means the trait path is `dst_rs::Time` / `dst_rs :: Time`, or a
-/// bare `Time` *only* when `dst_rs::Time` is imported in the file
-/// (`dst_rs_time_in_scope`). A `time`-named field of some OTHER `Arc<dyn …Time>`
-/// (e.g. `Arc<dyn my_crate::Time>`) is NOT treated as already-migrated — the
-/// caller records it as a conflict and skips the struct, so we never rewrite
-/// leaks against the wrong trait (silently preserving an uncontrolled clock).
-fn is_arc_dyn_time(ty: &syn::Type, dst_rs_time_in_scope: bool) -> bool {
+/// Recognition is deliberately syntactic-exact: the trait path must be
+/// `dst_rs::Time` or `::dst_rs::Time` (exactly two segments, `dst_rs` then
+/// `Time`). This is precisely what `migrate` emits (see [`FIELD_DECL`]), so its
+/// own output is recognized on re-run (idempotency), while a `time`-named field
+/// of any OTHER shape — a bare `Arc<dyn Time>`, `Arc<dyn my_crate::Time>`, or a
+/// nested `Arc<dyn foo::dst_rs::Time>` — is NOT treated as already-migrated. We
+/// do not attempt to prove a bare `Time` refers to `dst_rs::Time`: syntactic
+/// `use` tracking cannot be done soundly without a name resolver, and a false
+/// "already migrated" verdict would rewrite leaks against an uncontrolled clock.
+/// The caller records such a field as a conflict and skips the struct.
+fn is_arc_dyn_time(ty: &syn::Type) -> bool {
     let syn::Type::Path(tp) = ty else {
         return false;
     };
@@ -578,19 +578,12 @@ fn is_arc_dyn_time(ty: &syn::Type, dst_rs_time_in_scope: bool) -> bool {
                 if let syn::TypeParamBound::Trait(tb) = b {
                     let segs: Vec<&syn::Ident> =
                         tb.path.segments.iter().map(|s| &s.ident).collect();
-                    let n = segs.len();
-                    if n == 0 || segs[n - 1] != "Time" {
-                        continue;
-                    }
-                    // `dst_rs::Time` (or any path whose penultimate segment is
-                    // `dst_rs`) is provably our trait.
-                    if n >= 2 && segs[n - 2] == "dst_rs" {
-                        return true;
-                    }
-                    // A bare `Time` is our trait only if it was imported from
-                    // dst_rs in this file. Any other unqualified/foreign `Time`
-                    // is UNPROVEN — do not treat it as already-migrated.
-                    if n == 1 && dst_rs_time_in_scope {
+                    // ONLY the exact `dst_rs::Time` / `::dst_rs::Time` path
+                    // (two segments: `dst_rs` then `Time`). A leading `::`
+                    // leaves the segments unchanged, so both forms match here.
+                    // Anything else (bare `Time`, `my_crate::Time`,
+                    // `foo::dst_rs::Time`) is UNPROVEN and not our clock.
+                    if segs.len() == 2 && segs[0] == "dst_rs" && segs[1] == "Time" {
                         return true;
                     }
                 }
@@ -598,45 +591,6 @@ fn is_arc_dyn_time(ty: &syn::Type, dst_rs_time_in_scope: bool) -> bool {
         }
     }
     false
-}
-
-/// Whether the file imports `dst_rs::Time` into bare-name scope (so a field
-/// typed `Arc<dyn Time>` can be proven to be `dst_rs::Time`). Recurses into
-/// inline modules. `use dst_rs::Time`, `use dst_rs::{Time, …}`, and
-/// `use dst_rs::*` all count; `use dst_rs::Time as X` does NOT (the bare name
-/// `Time` is not brought into scope).
-fn file_imports_dst_rs_time(ast: &syn::File) -> bool {
-    items_import_dst_rs_time(&ast.items)
-}
-
-fn items_import_dst_rs_time(items: &[syn::Item]) -> bool {
-    items.iter().any(|it| match it {
-        syn::Item::Use(u) => use_tree_imports_dst_rs_time(&u.tree),
-        syn::Item::Mod(m) => m
-            .content
-            .as_ref()
-            .map(|(_, items)| items_import_dst_rs_time(items))
-            .unwrap_or(false),
-        _ => false,
-    })
-}
-
-fn use_tree_imports_dst_rs_time(tree: &syn::UseTree) -> bool {
-    match tree {
-        syn::UseTree::Path(p) if p.ident == "dst_rs" => use_subtree_names_time(&p.tree),
-        _ => false,
-    }
-}
-
-fn use_subtree_names_time(tree: &syn::UseTree) -> bool {
-    match tree {
-        syn::UseTree::Name(n) => n.ident == "Time",
-        syn::UseTree::Glob(_) => true, // `dst_rs::*` brings `Time` into scope
-        syn::UseTree::Group(g) => g.items.iter().any(use_subtree_names_time),
-        // `dst_rs::time::Time` (a deeper module path) or `Time as X` (rename):
-        // conservatively NOT counted as a provable bare-`Time` import.
-        syn::UseTree::Path(_) | syn::UseTree::Rename(_) => false,
-    }
 }
 
 impl<'ast> Visit<'ast> for StructCollector<'_> {
@@ -650,7 +604,7 @@ impl<'ast> Visit<'ast> for StructCollector<'_> {
                 let mut conflict = false;
                 for f in &named.named {
                     if f.ident.as_ref().map(|i| i == "time").unwrap_or(false) {
-                        if is_arc_dyn_time(&f.ty, self.dst_rs_time_in_scope) {
+                        if is_arc_dyn_time(&f.ty) {
                             injected = true;
                         } else {
                             conflict = true;
@@ -1811,40 +1765,90 @@ impl Foo {
     }
 
     #[test]
-    fn bare_time_field_is_migrated_only_when_imported_from_dst_rs() {
-        // With `use dst_rs::Time;` in scope, a bare `Arc<dyn Time>` IS provably
-        // our injected clock → already-migrated → idempotent no-op.
+    fn bare_time_field_is_never_treated_as_injected() {
+        // Recognition is exact-path only: a bare `Arc<dyn Time>` is UNPROVEN
+        // (syntactic `use` tracking is unsound without a resolver) → treated as a
+        // conflict, never silently accepted as our clock. This holds regardless
+        // of any `use dst_rs::Time;` import in the file.
         let imported = r#"
 use dst_rs::Time;
-struct Foo { time: std::sync::Arc<dyn Time>, x: u8 }
-impl Foo {
-    fn new() -> Self { Self { time: std::sync::Arc::new(dst_rs::ProductionTime::default()), x: 0 } }
-    fn now(&self) -> i64 { self.time.now_ms() }
-}
-"#;
-        let r = plan(imported);
-        assert!(
-            r.no_op,
-            "imported bare `Time` must read as already-migrated"
-        );
-        assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
-
-        // WITHOUT the import, a bare `Arc<dyn Time>` is UNPROVEN → treated as a
-        // conflict, not silently accepted as our clock.
-        let unimported = r#"
 struct Foo { time: std::sync::Arc<dyn Time>, x: u8 }
 impl Foo {
     fn tick(&self) -> std::time::Instant { Instant::now() }
 }
 "#;
-        let r2 = plan(unimported);
-        assert!(r2.changes.is_empty() && r2.structs_migrated.is_empty());
-        assert_eq!(r2.skips.len(), 1);
+        let r = plan(imported);
+        assert!(r.changes.is_empty() && r.structs_migrated.is_empty());
+        assert_eq!(r.skips.len(), 1);
         assert!(
-            r2.skips[0].reason.contains("different type"),
+            r.skips[0].reason.contains("different type"),
             "reason: {}",
-            r2.skips[0].reason
+            r.skips[0].reason
         );
+    }
+
+    #[test]
+    fn mod_local_dst_rs_import_does_not_leak_to_sibling_bare_time() {
+        // BLOCKER regression: an inline `mod m { use dst_rs::Time; }` must NOT
+        // make an unrelated top-level `time: Arc<dyn Time>` look injected. Rust
+        // scope is per-module; the old file-wide import flag conflated them.
+        let src = r#"
+mod m { use dst_rs::Time; }
+struct Foo { time: std::sync::Arc<dyn Time>, x: u8 }
+impl Foo {
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty() && r.structs_migrated.is_empty(),
+            "sibling bare `Time` must not read as injected"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("different type"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn nested_dst_rs_path_time_is_not_treated_as_injected() {
+        // BLOCKER regression: `Arc<dyn foo::dst_rs::Time>` is NOT `dst_rs::Time`.
+        // The old penultimate-segment check accepted any `*::dst_rs::Time`.
+        let src = r#"
+struct Foo { time: std::sync::Arc<dyn foo::dst_rs::Time>, x: u8 }
+impl Foo {
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        assert!(
+            r.changes.is_empty() && r.structs_migrated.is_empty(),
+            "nested `foo::dst_rs::Time` must not read as injected"
+        );
+        assert_eq!(r.skips.len(), 1);
+        assert!(
+            r.skips[0].reason.contains("different type"),
+            "reason: {}",
+            r.skips[0].reason
+        );
+    }
+
+    #[test]
+    fn leading_colon_dst_rs_time_is_treated_as_injected() {
+        // The absolute path `::dst_rs::Time` IS our trait (leading `::` leaves
+        // the two segments unchanged) → already-migrated no-op.
+        let src = r#"
+struct Foo { time: std::sync::Arc<dyn ::dst_rs::Time>, x: u8 }
+impl Foo {
+    fn new() -> Self { Self { time: std::sync::Arc::new(dst_rs::ProductionTime::default()), x: 0 } }
+    fn now(&self) -> i64 { self.time.now_ms() }
+}
+"#;
+        let r = plan(src);
+        assert!(r.no_op, "`::dst_rs::Time` must read as already-migrated");
+        assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
     }
 
     #[test]

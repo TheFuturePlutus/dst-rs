@@ -50,6 +50,16 @@ impl Category {
             Category::Concurrency => "CONCURRENCY",
         }
     }
+
+    /// Whether this category is a HIGH-CONFIDENCE leak. `true` for the four hard
+    /// categories (time / random / network / concurrency); `false` only for
+    /// [`Category::PossibleRandom`], the explicitly low-confidence guess.
+    ///
+    /// The `--deny` CI gate fails only on hard categories, so a lone
+    /// `PossibleRandom` (e.g. a user `Config::from_entropy()`) never breaks CI.
+    pub fn is_hard(self) -> bool {
+        !matches!(self, Category::PossibleRandom)
+    }
 }
 
 /// A single detected determinism leak.
@@ -149,6 +159,7 @@ pub fn scan_source(file: &str, content: &str, report: &mut ScanReport) {
         lines: &lines,
         fn_stack: Vec::new(),
         leaks: Vec::new(),
+        os_rng_imported: file_imports_os_rng(&ast),
     };
     visitor.visit_file(&ast);
     report.leaks.append(&mut visitor.leaks);
@@ -217,12 +228,12 @@ fn classify_call(segs: &[String]) -> Option<Category> {
             Category::PossibleRandom
         });
     }
-    // `OsRng` reached in call form (e.g. `OsRng::default()`); the bare-value and
-    // method-receiver forms (`let r = OsRng;`, `OsRng.next_u64()`) are caught by
-    // the path/method visitors.
-    if segs.iter().any(|s| s == "OsRng") {
-        return Some(Category::Random);
-    }
+    // NOTE: `OsRng` is NOT classified here. Because the bare name `OsRng` also
+    // names unrelated symbols (e.g. a user `enum Source { OsRng }`), it must be
+    // qualified against `rand::rngs` — or a proven `use rand::rngs::OsRng` — to
+    // be a HARD leak. That needs import context, so it is handled in the visitor
+    // (`visit_expr_call` / `visit_expr_path`) via `classify_os_rng`, which
+    // downgrades unrecognized receivers to `PossibleRandom`.
 
     // ── Network ──
     if first == "reqwest" {
@@ -269,6 +280,69 @@ fn is_rng_receiver(seg: &str) -> bool {
     seg.ends_with("Rng") || KNOWN_RNGS.contains(&seg)
 }
 
+/// Classify a use of the `OsRng` symbol given the path segment immediately
+/// before it (`qualifier`) and whether the file provably imports
+/// `rand::rngs::OsRng`.
+///
+/// Hard [`Category::Random`] ONLY for the real OS generator:
+/// `rand::rngs::OsRng` / `rngs::OsRng` (qualifier is `rngs`), or a bare `OsRng`
+/// under a proven `use rand::rngs::OsRng`. Any other receiver — e.g. a
+/// `Source::OsRng` enum variant, or a bare `OsRng` we cannot tie to `rand` — is
+/// downgraded to lower-confidence [`Category::PossibleRandom`] so it is reported
+/// but never a hard leak / CI failure.
+fn classify_os_rng(qualifier: Option<&str>, os_rng_imported: bool) -> Category {
+    match qualifier {
+        Some("rngs") => Category::Random,
+        None if os_rng_imported => Category::Random,
+        _ => Category::PossibleRandom,
+    }
+}
+
+/// Whether the file's TOP-LEVEL `use` items bring the bare name `OsRng` into
+/// scope from `rand::rngs`: `use rand::rngs::OsRng`, `use rand::rngs::{OsRng,…}`,
+/// `use rand::{rngs::OsRng, …}`, or `use rand::rngs::*`. A rename (`… as X`) does
+/// NOT (the bare name is not introduced).
+///
+/// We deliberately do NOT recurse into inline `mod` blocks: `mod m { use
+/// rand::rngs::OsRng; }` does not bring `OsRng` into the file's outer scope, and
+/// treating it as if it did would hard-flag an unrelated sibling `OsRng`
+/// (unsound without a name resolver). A missed import merely downgrades a real
+/// bare `OsRng` to `PossibleRandom`, which is the safe (conservative) direction.
+fn file_imports_os_rng(ast: &syn::File) -> bool {
+    ast.items.iter().any(|it| match it {
+        syn::Item::Use(u) => use_tree_after_rand(&u.tree),
+        _ => false,
+    })
+}
+
+/// Match a `use` tree rooted at `rand`, descending toward `rngs::OsRng`.
+fn use_tree_after_rand(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(p) if p.ident == "rand" => use_tree_after_rngs(&p.tree),
+        _ => false,
+    }
+}
+
+/// Match the `rngs::<…>` portion of a `rand::…` use tree.
+fn use_tree_after_rngs(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Path(p) if p.ident == "rngs" => use_tree_names_os_rng(&p.tree),
+        syn::UseTree::Group(g) => g.items.iter().any(use_tree_after_rngs),
+        _ => false,
+    }
+}
+
+/// Match the leaf naming `OsRng` (or a glob) under `rand::rngs`.
+fn use_tree_names_os_rng(tree: &syn::UseTree) -> bool {
+    match tree {
+        syn::UseTree::Name(n) => n.ident == "OsRng",
+        syn::UseTree::Glob(_) => true, // `rand::rngs::*` brings `OsRng` into scope
+        syn::UseTree::Group(g) => g.items.iter().any(use_tree_names_os_rng),
+        // A deeper `Path` or a `Rename` does not introduce the bare `OsRng`.
+        syn::UseTree::Path(_) | syn::UseTree::Rename(_) => false,
+    }
+}
+
 // ── AST visitor ────────────────────────────────────────────────────────────
 
 struct LeakVisitor<'a> {
@@ -276,6 +350,10 @@ struct LeakVisitor<'a> {
     lines: &'a [Vec<char>],
     fn_stack: Vec<String>,
     leaks: Vec<Leak>,
+    /// The file provably imports `rand::rngs::OsRng` into bare-name scope, so a
+    /// bare `OsRng` value/receiver is the real generator (a HARD leak) rather
+    /// than a lower-confidence guess. See [`file_imports_os_rng`].
+    os_rng_imported: bool,
 }
 
 impl LeakVisitor<'_> {
@@ -322,6 +400,17 @@ impl<'ast> Visit<'ast> for LeakVisitor<'_> {
                 .collect();
             if let Some(cat) = classify_call(&segs) {
                 self.record(cat, node.span());
+            } else if let Some(pos) = segs.iter().rposition(|s| s == "OsRng") {
+                // Call form on the `OsRng` type (e.g. `OsRng::default()`,
+                // `rand::rngs::OsRng::new(...)`). Qualify against the segment
+                // before `OsRng` so a `Source::OsRng::…` variant is not a hard
+                // leak. The bare-value/receiver forms are handled by
+                // `visit_expr_path`; a call ends past `OsRng`, so no overlap.
+                let qualifier = pos.checked_sub(1).map(|i| segs[i].as_str());
+                self.record(
+                    classify_os_rng(qualifier, self.os_rng_imported),
+                    node.span(),
+                );
             }
         }
         visit::visit_expr_call(self, node);
@@ -342,15 +431,24 @@ impl<'ast> Visit<'ast> for LeakVisitor<'_> {
         // bound to a local (`let mut rng = OsRng;`), used as a receiver
         // (`OsRng.next_u64()`), or passed by value. A call-form assoc access like
         // `OsRng::default` ends in `default`, so it is NOT matched here (it is
-        // handled by `classify_call`), avoiding a double count.
-        if node
-            .path
-            .segments
-            .last()
-            .map(|s| s.ident == "OsRng")
-            .unwrap_or(false)
-        {
-            self.record(Category::Random, node.span());
+        // handled in `visit_expr_call`), avoiding a double count.
+        //
+        // Only the REAL generator is a HARD leak: `rand::rngs::OsRng` /
+        // `rngs::OsRng`, or a bare `OsRng` under a proven import. A qualified
+        // `Source::OsRng` (enum variant) or an unproven bare `OsRng` is
+        // downgraded to `PossibleRandom` by `classify_os_rng`.
+        let segs = &node.path.segments;
+        if segs.last().map(|s| s.ident == "OsRng").unwrap_or(false) {
+            let n = segs.len();
+            let qualifier = if n >= 2 {
+                Some(segs[n - 2].ident.to_string())
+            } else {
+                None
+            };
+            self.record(
+                classify_os_rng(qualifier.as_deref(), self.os_rng_imported),
+                node.span(),
+            );
         }
         visit::visit_expr_path(self, node);
     }
@@ -396,15 +494,69 @@ mod tests {
     #[test]
     fn os_rng_bound_to_a_local_is_flagged() {
         // `let mut rng = OsRng; rng.fill_bytes(..)` — OsRng appears as a bare
-        // value/path expression, not as a method receiver. It must still be
-        // flagged (regression: the receiver-only check missed this).
-        let leaks =
-            scan("fn f() { let mut rng = OsRng; let mut b = [0u8; 8]; rng.fill_bytes(&mut b); }");
+        // value/path expression, not as a method receiver. With a proven
+        // `use rand::rngs::OsRng`, the bare form must still be a HARD leak
+        // (regression: the receiver-only check missed this).
+        let leaks = scan(
+            "use rand::rngs::OsRng; fn f() { let mut rng = OsRng; let mut b = [0u8; 8]; rng.fill_bytes(&mut b); }",
+        );
         let os: Vec<_> = leaks
             .iter()
             .filter(|l| l.category == Category::Random && l.snippet.contains("OsRng"))
             .collect();
         assert_eq!(os.len(), 1, "expected exactly one OsRng leak: {leaks:#?}");
+    }
+
+    #[test]
+    fn bare_os_rng_without_import_is_possible_random_not_hard() {
+        // Without a proven `use rand::rngs::OsRng`, a bare `OsRng` cannot be tied
+        // to `rand` → lower-confidence POSSIBLE-RANDOM, never a hard leak.
+        let leaks = scan("fn f() { let _rng = OsRng; }");
+        assert!(
+            !leaks.iter().any(|l| l.category == Category::Random),
+            "unproven bare OsRng must not be hard RANDOM: {leaks:#?}"
+        );
+        assert!(
+            leaks.iter().any(|l| l.category == Category::PossibleRandom),
+            "unproven bare OsRng should be POSSIBLE-RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn imported_bare_os_rng_is_hard_random() {
+        // `use rand::rngs::OsRng; let r = OsRng;` — the real generator, proven by
+        // import → HARD RANDOM.
+        let leaks = scan("use rand::rngs::OsRng; fn f() { let _r = OsRng; }");
+        assert!(
+            leaks
+                .iter()
+                .any(|l| l.category == Category::Random && l.snippet.contains("OsRng")),
+            "imported bare OsRng must be hard RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn enum_variant_os_rng_is_not_hard_random() {
+        // `enum Source { OsRng }` then `Source::OsRng` — a user enum variant that
+        // merely shares the name must NOT be a hard RANDOM false positive.
+        let leaks = scan("enum Source { OsRng } fn f() -> Source { Source::OsRng }");
+        assert!(
+            !leaks.iter().any(|l| l.category == Category::Random),
+            "Source::OsRng variant must not be hard RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn fully_qualified_os_rng_is_hard_random_without_import() {
+        // `rand::rngs::OsRng.next_u64()` needs no import — the `rngs` qualifier
+        // proves the real generator → HARD RANDOM.
+        let leaks = scan("fn f() -> u64 { rand::rngs::OsRng.next_u64() }");
+        assert!(
+            leaks
+                .iter()
+                .any(|l| l.category == Category::Random && l.snippet.contains("OsRng")),
+            "qualified OsRng must be hard RANDOM: {leaks:#?}"
+        );
     }
 
     #[test]
