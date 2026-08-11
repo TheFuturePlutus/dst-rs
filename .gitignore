@@ -1,0 +1,21 @@
+# Rust build artifacts
+/target
+**/target/
+
+# Backup / migration artifacts written by dst-cli during rewrites
+*.bak
+*.orig
+*.rs.dst-bak
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
+
+# Environment / local overrides
+.env
+.env.local

@@ -1,0 +1,93 @@
+---
+description: Make a Rust crate deterministically testable with dst-rs. When the user asks to make a crate replayable / deterministically testable / fault-injectable, drive the dst-cli scan + migrate tools, hand-finish the leaks migrate skips, and scaffold a seed-loop DST test — keeping the tree compiling at every step.
+globs: ["**/*.rs", "**/Cargo.toml"]
+alwaysApply: false
+---
+
+# Make this crate deterministically testable (dst-rs)
+
+When the user asks to "make this crate deterministically testable" (or
+replayable / fault-injectable), follow this playbook. You drive the already-built
+`dst-cli` tools (`dst scan`, `dst migrate`) and hand-finish what they skip. Do
+**not** write new tooling; do **not** invent CLI flags or `dst-rs` methods.
+
+The binary is `dst` (crate `dst-cli`); in-repo run it as
+`cargo run -q -p dst-cli --`.
+
+## Prime rule: the tree compiles at every step
+
+Every step is seam-safe. `dst migrate` adds a `time` field defaulted to the
+production clock, so existing callers are unchanged. Migrate one struct at a
+time, `cargo check` after each edit, and **prefer a false negative** (leave a
+leak, report it) **over a wrong rewrite**. Never commit a red tree.
+
+## Step 1 — Scan
+
+```bash
+dst scan --json <path>     # array of {file,line,col,category,snippet,fn}
+dst scan <path>            # human summary
+```
+
+Categories: `time`, `random`, `network`, `concurrency`. Summarize the counts to
+the user. `--deny` turns scan into a non-zero CI gate.
+
+## Step 2 — Ensure dst-rs is a dependency (before migrate)
+
+`dst migrate` runs `cargo check` after rewriting and **auto-restores if it
+fails**; the rewrites reference `dst_rs::Time` / `dst_rs::ProductionTime`, so a
+crate without the dep produces no change. Add it first:
+
+```bash
+cargo add dst-rs --manifest-path <crate>/Cargo.toml          # runtime use
+# cargo add dst-rs --dev --manifest-path <crate>/Cargo.toml  # test-only use
+```
+
+If dst-rs isn't published, add a path/workspace dependency by hand and confirm
+with `cargo check`.
+
+## Step 3 — Migrate the time seams
+
+```bash
+dst migrate --dry-run <path>   # unified diff, writes nothing
+dst migrate <path>             # applies, then runs cargo check
+```
+
+v1 rewrites TIME leaks in inherent methods of named-field structs only: adds
+`time: std::sync::Arc<dyn dst_rs::Time>` (defaulted to `dst_rs::ProductionTime`),
+and maps `SystemTime::now()…as_millis()` → `self.time.now_ms()`,
+`Instant::now()` → `self.time.instant_now()`, `tokio::time::sleep(d).await` →
+`self.time.sleep(d).await`. `--traits` accepts only `time` in v1. Report the
+migrate summary (structs migrated / leaks rewritten / leaks skipped / check
+outcome).
+
+## Step 4 — Hand-finish skipped leaks (same conventions)
+
+- **Free functions**: thread an explicit `time: &dyn dst_rs::Time` param and
+  update callers (no `self` to hang a clock off).
+- **Random** (`rand::random`, `thread_rng`, `.gen`/`.gen_range`,
+  `Uuid::new_v4`, `fastrand`): add `rng: Arc<dyn dst_rs::Random>` defaulted to
+  `ProductionRandom`; route via `self.rng.next_u64()` / `next_uuid()` /
+  `shuffle_u64()`.
+- **Network** (`reqwest`, `TcpStream`, `TcpListener`, tokio net): hide behind a
+  trait the test fakes; DST supplies `SimulatedNetwork` + `FaultSchedule`.
+- **Concurrency** (`std::thread::spawn`, `tokio::spawn`): route through an
+  injected `Executor` (`ProductionExecutor` / `SimulatedExecutor` / `SimScheduler`).
+
+Default every injected field to the production impl. Add a test-only injecting
+constructor (e.g. `with_time(tokens, Arc<dyn Time>)`) so tests can pass a
+`SimulatedTime`; keep `new` on the production default.
+
+## Step 5 — Scaffold a seed-loop DST test
+
+Model it on `crates/dst-rs/examples/kv_chaos.rs`: inject `SimulatedTime`, loop
+seeds, build `FaultSchedule::generate(seed, steps, density)`, step through it,
+assert an invariant via `InvariantEngine`. Honor `SEED=<n>` for single-seed
+triage. Real API only: `SimulatedTime::new/advance_ms`,
+`SimulatedRandom::from_seed/next_u64`, `FaultSchedule::generate/at/fault_steps`,
+`Fault::{None,TransientError,CrashRestart,ClockSkew}`,
+`InvariantEngine::new/check`, `Invariant::new`, `ddmin`.
+
+## Step 6 — Verify and report
+
+`cargo check` && `cargo test` must be green. Report: what changed, the test
+added, and the replay hint `SEED=<n> cargo test <name> -- --nocapture`.
