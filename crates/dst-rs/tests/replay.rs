@@ -6,6 +6,8 @@
 //! and prove: same seed ⇒ identical trace, different seed ⇒ different trace.
 
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use dst_rs::{
@@ -82,6 +84,55 @@ fn sim_scheduler_interleaving_replays_identically() {
         "scheduler interleaving + poll count must be reproducible"
     );
     assert_eq!(a.0.len(), 12);
+}
+
+/// CLAIM (Part B): **same seed reproduces the trace under `SimScheduler`.** A
+/// seed-parameterized concurrent workload (each task yields a seed-derived number
+/// of times, so the seed shapes the interleaving) is driven through the scheduler
+/// and its interleaving trace is hashed. The same seed yields an identical hash;
+/// a different seed yields a different one.
+#[test]
+fn same_seed_reproduces_scheduler_trace_hash() {
+    fn trace_hash(seed: u64) -> u64 {
+        let rng = SimulatedRandom::from_seed(seed);
+        // Seed-derived yield counts steer where each task lands in the FIFO ready
+        // queue — i.e. the interleaving the scheduler realizes.
+        let counts: Vec<u64> = (0..4).map(|_| rng.next_u64() % 4).collect();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut s = SimScheduler::new();
+        for id in 0..4u64 {
+            let log = Rc::clone(&log);
+            let n = counts[id as usize];
+            s.spawn(async move {
+                for step in 0..=n {
+                    log.borrow_mut().push((id, step));
+                    sim_yield_now().await;
+                }
+            });
+        }
+        s.run();
+        let mut h = DefaultHasher::new();
+        log.borrow().hash(&mut h);
+        // Fold in the poll count too — another determinism witness.
+        s.steps().hash(&mut h);
+        h.finish()
+    }
+
+    // Same seed → identical trace hash, run to run.
+    for seed in [1u64, 7, 42, 1000] {
+        assert_eq!(
+            trace_hash(seed),
+            trace_hash(seed),
+            "seed {seed} must reproduce the identical scheduler trace"
+        );
+    }
+
+    // Different seeds → the trace diverges (not all seeds collapse to one trace).
+    let distinct: std::collections::BTreeSet<u64> = (0..20u64).map(trace_hash).collect();
+    assert!(
+        distinct.len() > 1,
+        "distinct seeds must produce more than one scheduler trace"
+    );
 }
 
 /// Replaying a schedule from the same seed yields the same fault at every step,

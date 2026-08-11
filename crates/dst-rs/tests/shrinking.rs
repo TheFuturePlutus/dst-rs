@@ -76,6 +76,53 @@ fn finds_a_minimal_two_fault_conjunction() {
     }
 }
 
+/// CLAIM (Part B): **shrinking is 1-minimal.** After `ddmin` reduces a noisy,
+/// seed-generated fault timeline whose failure needs a specific two-fault
+/// conjunction, removing ANY single element from the shrunk set must stop
+/// reproducing the failure. This asserts 1-minimality generically over the
+/// shrunk output (not just the size).
+#[test]
+fn shrunk_fault_set_is_one_minimal() {
+    // A realistic, noisy timeline from a seed, plus two planted essential faults
+    // that the failure requires BOTH of.
+    let mut faults = FaultSchedule::generate(20260811, 96, 30)
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    faults[17] = Fault::CrashRestart;
+    faults[71] = Fault::ClockSkew(1234);
+    let sched = FaultSchedule::from_faults(faults);
+
+    let fault_points: Vec<(usize, Fault)> = sched
+        .fault_steps()
+        .into_iter()
+        .map(|i| (i, sched.at(i)))
+        .collect();
+    assert!(
+        fault_points.len() > 10,
+        "need a non-trivial timeline to make shrinking meaningful"
+    );
+
+    // The failure needs the crash at 17 AND the skew at 71 — both present.
+    let reproduces = |subset: &[(usize, Fault)]| {
+        subset.iter().any(|&(i, _)| i == 17) && subset.iter().any(|&(i, _)| i == 71)
+    };
+
+    let minimal = ddmin(&fault_points, reproduces);
+    assert!(reproduces(&minimal), "the shrunk set must still reproduce");
+
+    // 1-minimality: dropping any single element must break reproduction.
+    for i in 0..minimal.len() {
+        let mut without = minimal.clone();
+        without.remove(i);
+        assert!(
+            !reproduces(&without),
+            "not 1-minimal: removing element {i} ({:?}) still reproduces",
+            minimal[i]
+        );
+    }
+}
+
 /// Shrinking is deterministic: the same failing input yields the same reproducer.
 #[test]
 fn shrinking_is_deterministic() {
