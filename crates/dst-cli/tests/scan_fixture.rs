@@ -60,9 +60,9 @@ fn finds_exactly_the_expected_leaks() {
 
     // Exact per-category counts.
     assert_eq!(count(&leaks, "time"), 5, "TIME leaks: {leaks:#?}");
-    // 10 RANDOM: rand::random, thread_rng, gen_range, gen, fastrand, Uuid::new_v4,
-    // Uuid::now_v7, SmallRng::from_entropy, OsRng (receiver form), OsRng (bound to
-    // a local — value/path-expression form).
+    // 10 RANDOM: rand::random, thread_rng (bare/rand-qualified), gen_range, gen,
+    // fastrand, Uuid::new_v4, Uuid::now_v7, SmallRng::from_entropy, OsRng (receiver),
+    // OsRng (value/path). A foreign `my_utils::thread_rng()` is deliberately NOT one.
     assert_eq!(count(&leaks, "random"), 10, "RANDOM leaks: {leaks:#?}");
     assert_eq!(count(&leaks, "network"), 5, "NETWORK leaks: {leaks:#?}");
     assert_eq!(
@@ -174,59 +174,6 @@ fn run_scan(dir: &str, extra: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn possible_random_is_listed_in_human_report() {
-    // MAJOR 4 regression: a scan whose only finding is POSSIBLE-RANDOM must LIST
-    // it (previously it was counted in the total but never displayed) and the
-    // summary count must match.
-    let out = run_scan("possible_only", &[]);
-    assert!(out.status.success(), "scan should succeed without --deny");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
-    assert!(
-        stdout.contains("POSSIBLE-RANDOM (1)"),
-        "human report must list the POSSIBLE-RANDOM finding:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("from_entropy"),
-        "the finding snippet must appear:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("1 possible-random"),
-        "summary line must count possible-random:\n{stdout}"
-    );
-    // It must not masquerade as a hard RANDOM leak.
-    assert!(
-        stdout.contains("0 random"),
-        "possible-random must not be counted as hard random:\n{stdout}"
-    );
-    // JSON total is 1 and the single leak is possible-random.
-    let leaks = run_scan_dir_json("possible_only");
-    assert_eq!(leaks.len(), 1, "exactly one finding: {leaks:#?}");
-    assert_eq!(leaks[0].category, "possible-random");
-}
-
-#[test]
-fn deny_does_not_fail_on_possible_random_only() {
-    // MAJOR 5 regression: `--deny` on a possible-random-only scan exits 0.
-    let out = run_scan("possible_only", &["--deny"]);
-    assert!(
-        out.status.success(),
-        "--deny must not fail on POSSIBLE-RANDOM only: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-}
-
-#[test]
-fn deny_possible_fails_on_possible_random() {
-    // Opt-in `--deny-possible` DOES fail on a possible-random-only scan.
-    let out = run_scan("possible_only", &["--deny", "--deny-possible"]);
-    assert!(
-        !out.status.success(),
-        "--deny --deny-possible must fail on POSSIBLE-RANDOM"
-    );
-}
-
-#[test]
 fn deny_fails_on_hard_leak() {
     // MAJOR 5 regression: `--deny` on a hard leak exits non-zero.
     let out = run_scan("hard_only", &["--deny"]);
@@ -234,14 +181,4 @@ fn deny_fails_on_hard_leak() {
         !out.status.success(),
         "--deny must fail on a hard (time) leak"
     );
-}
-
-fn run_scan_dir_json(dir: &str) -> Vec<Leak> {
-    let out = run_scan(dir, &["--json"]);
-    assert!(
-        out.status.success(),
-        "scan --json exited non-zero: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    serde_json::from_slice(&out.stdout).expect("scan did not emit valid JSON")
 }

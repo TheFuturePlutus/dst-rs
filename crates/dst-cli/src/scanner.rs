@@ -6,23 +6,40 @@
 //!
 //! ## What this is (and is NOT)
 //!
-//! This is a **syntactic heuristic**, not a sound analyzer. It matches the
-//! segments of a call/path exactly as written and does **no name resolution**
-//! — no imports, aliases, glob `use`, or lexical scope are tracked. A leak is
-//! hard-flagged only when a determinism source appears as a recognized
-//! **fully-qualified path** (e.g. `rand::rngs::OsRng`, `std::time::SystemTime::
-//! now`; a leading `::` is transparent). Because there is no resolution, the
-//! scanner can miss a real leak reached through a bare or aliased import
-//! (`use rand::rngs::OsRng; … OsRng`) and cannot be relied on as a complete
-//! proof of determinism.
+//! This is a **name-based heuristic lint**, not a sound analyzer. It flags calls
+//! and paths whose *recognizable name or tail segments* match a known
+//! determinism source (`SystemTime::now`, `thread_rng`, `OsRng`, `reqwest::*`,
+//! `tokio::spawn`, …). It does **no name resolution** — imports, aliases, glob
+//! `use`, and lexical scope are not tracked — so it is a starting point for
+//! making a crate replayable, not a proof that one is deterministic. Two
+//! consequences follow directly from matching by name, and are accepted by
+//! design (a replay-safety gate should err toward flagging):
 //!
-//! Bare or aliased RNG idioms (`OsRng`, `thread_rng()`, `<X>::from_entropy()`
-//! that is not fully-qualified `rand`) are reported as the lower-confidence
-//! [`Category::PossibleRandom`] rather than hard `Random`, so a user's own
-//! `Config::from_entropy()` or `Source::OsRng` does not become a false
-//! positive. To catch these, **fully-qualify the source** in your code, or run
-//! with `--deny-possible` for stricter gating that also fails on
-//! `POSSIBLE-RANDOM` findings.
+//! * **False positives** on user symbols that merely share a name. Because
+//!   matching is on the name / tail segments, `my_time::SystemTime::now()` and
+//!   `builder.gen()` are flagged even though they are not the real determinism
+//!   sources. (Where a name is distinctive enough, a clearly foreign-qualified
+//!   path such as `my_utils::thread_rng()` is left alone.) Flagging is the safe
+//!   direction to be wrong in — review and dismiss the finding.
+//! * **False negatives** on renamed imports. An `as` alias hides the
+//!   recognizable name, so `use std::time::SystemTime as Sys; Sys::now()` and
+//!   `use rand::rngs::OsRng as Rng; Rng::default()` are NOT flagged. Closing
+//!   this gap would require full name resolution, which this tool deliberately
+//!   does not do — prefer the unaliased spelling, and treat a clean scan as a
+//!   prompt to review, not a proof.
+//!
+//! The [`migrate`](crate) codemod is a *separate*, deliberately conservative
+//! pass: it rewrites only the leaks it can map without ambiguity and leaves
+//! everything else untouched. The scanner flags aggressively; the codemod
+//! changes cautiously.
+//!
+//! ## Classification
+//!
+//! Every recognized source is a single hard [`Category`] — time / random /
+//! network / concurrency — and the `--deny` CI gate fails on any of them. There
+//! is no lower-confidence tier: for a replay-safety gate, erring toward flagging
+//! is the right default, and a name-based lint cannot honestly claim the
+//! precision a "confident vs. maybe" split would imply.
 //!
 //! ## Location reporting
 //!
@@ -42,18 +59,15 @@ use syn::visit::{self, Visit};
 use walkdir::WalkDir;
 
 /// The kind of non-determinism a leak introduces.
+///
+/// Every variant is a hard, gate-failing category — there is intentionally no
+/// low-confidence tier (see the module docs). Matching is by name, so any
+/// variant can be a false positive on a same-named user symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Category {
     Time,
     Random,
-    /// Lower-confidence randomness: an identifier shaped like a known RNG idiom
-    /// (a bare or aliased `OsRng` / `thread_rng` / `*::from_entropy()`) that is
-    /// NOT written as a recognized fully-qualified path, so the scanner — which
-    /// does no name resolution — cannot prove it is `rand`'s. Reported so a
-    /// human can confirm, but kept out of the hard `Random` set to avoid false
-    /// positives (e.g. a user's `Config::from_entropy()` or `Source::OsRng`).
-    PossibleRandom,
     Network,
     Concurrency,
 }
@@ -63,20 +77,9 @@ impl Category {
         match self {
             Category::Time => "TIME",
             Category::Random => "RANDOM",
-            Category::PossibleRandom => "POSSIBLE-RANDOM",
             Category::Network => "NETWORK",
             Category::Concurrency => "CONCURRENCY",
         }
-    }
-
-    /// Whether this category is a HIGH-CONFIDENCE leak. `true` for the four hard
-    /// categories (time / random / network / concurrency); `false` only for
-    /// [`Category::PossibleRandom`], the explicitly low-confidence guess.
-    ///
-    /// The `--deny` CI gate fails only on hard categories, so a lone
-    /// `PossibleRandom` (e.g. a user `Config::from_entropy()`) never breaks CI.
-    pub fn is_hard(self) -> bool {
-        !matches!(self, Category::PossibleRandom)
     }
 }
 
@@ -184,18 +187,17 @@ pub fn scan_source(file: &str, content: &str, report: &mut ScanReport) {
 
 // ── Classification ─────────────────────────────────────────────────────────
 //
-// This is a SYNTACTIC heuristic, not a sound analyzer. It matches the segments
-// of a call/path exactly as written — there is NO import, alias, or scope
-// resolution. A determinism source is hard-flagged only when it appears as a
-// recognized FULLY-QUALIFIED path (a leading `::` is transparent: it leaves the
-// segment idents unchanged, so `::rand::rngs::OsRng` matches `rand::rngs::OsRng`
-// too). Bare or aliased idioms are reported as `PossibleRandom`.
+// A NAME-BASED heuristic, not a sound analyzer. Matching is on the recognizable
+// name or tail segments of a call/path — there is NO import, alias, or scope
+// resolution. A leading `::` is transparent: it leaves the segment idents
+// unchanged, so `::rand::random` matches `rand::random`. Because we match by
+// name we accept false positives on same-named user symbols (e.g.
+// `my_time::SystemTime::now()`) and miss renamed imports (`SystemTime as Sys`).
 
 /// Classify a call path (the segments of `a::b::c` in `a::b::c(...)`).
 ///
-/// Purely segment matching: no name resolution. Fully-qualified determinism
-/// sources are hard-flagged; anything else returns `None` here (bare/aliased
-/// RNG idioms are handled as `PossibleRandom` by the visitor).
+/// Purely name/segment matching: no resolution. Returns the hard [`Category`]
+/// for a recognized source, else `None`.
 fn classify_call(segs: &[String]) -> Option<Category> {
     if segs.is_empty() {
         return None;
@@ -206,29 +208,31 @@ fn classify_call(segs: &[String]) -> Option<Category> {
     let first = segs[0].as_str();
 
     // ── Time ──
-    if prev == "SystemTime" && last == "now" {
-        return Some(Category::Time);
-    }
-    if prev == "Instant" && last == "now" {
+    // `SystemTime::now` / `Instant::now` / chrono `Utc::now` / `Local::now`.
+    if matches!(prev, "SystemTime" | "Instant" | "Utc" | "Local") && last == "now" {
         return Some(Category::Time);
     }
     if prev == "thread" && last == "sleep" {
         return Some(Category::Time);
     }
     // tokio::time::{sleep, sleep_until, interval, timeout}. Require the `time`
-    // qualifier so a user's own free `sleep()`/`timeout()` is not flagged.
+    // segment so a bare user `sleep()`/`timeout()` (no `time::` qualifier) is
+    // not flagged.
     if prev == "time" && matches!(last, "sleep" | "sleep_until" | "interval" | "timeout") {
-        return Some(Category::Time);
-    }
-    if (prev == "Utc" || prev == "Local") && last == "now" {
         return Some(Category::Time);
     }
 
     // ── Random ──
-    // Fully-qualified `rand::random()` / `rand::thread_rng()`. A bare
-    // `thread_rng()` (no `rand::` qualifier) is handled as POSSIBLE-RANDOM in
-    // the visitor; a user's own `my_utils::thread_rng()` is never flagged.
-    if prev == "rand" && matches!(last, "random" | "thread_rng") {
+    // `rand::random()` — this one needs the `rand` segment, because a bare
+    // `random()` is far too common a name to flag on its own.
+    if prev == "rand" && last == "random" {
+        return Some(Category::Random);
+    }
+    // `thread_rng` — bare `thread_rng()` (likely a `use rand::thread_rng`) or a
+    // `rand`-qualified path. A clearly foreign-qualified `my_utils::thread_rng()`
+    // is NOT flagged, so we avoid the obvious false positive on a same-named
+    // user function.
+    if last == "thread_rng" && (n == 1 || segs[..n - 1].iter().any(|s| s == "rand")) {
         return Some(Category::Random);
     }
     if first == "fastrand" {
@@ -237,10 +241,16 @@ fn classify_call(segs: &[String]) -> Option<Category> {
     if prev == "Uuid" && matches!(last, "new_v4" | "now_v7") {
         return Some(Category::Random);
     }
-    // Fully-qualified `rand::…::from_entropy()` (seeding a PRNG from OS entropy).
-    // The `rand` head proves it is the real generator. A bare / non-rand
-    // `<X>::from_entropy()` is POSSIBLE-RANDOM, handled in the visitor.
-    if first == "rand" && last == "from_entropy" {
+    // `<receiver>::from_entropy()` — seeding a PRNG from OS entropy. Requires a
+    // receiver segment: a bare free `from_entropy()` (`n == 1`) is NOT flagged,
+    // as it carries no signal that it is an RNG constructor.
+    if n >= 2 && last == "from_entropy" {
+        return Some(Category::Random);
+    }
+    // Call form `OsRng::default()` (bare or `rand::rngs::OsRng::default()`).
+    // The value/path form of `OsRng` is caught in `visit_expr_path`; that
+    // visitor never sees this one, whose last segment is `default`.
+    if prev == "OsRng" && last == "default" {
         return Some(Category::Random);
     }
 
@@ -270,25 +280,13 @@ fn classify_call(segs: &[String]) -> Option<Category> {
     None
 }
 
-/// Classify a method call by its method name. Only the unambiguous `rand`
-/// idioms `.gen()` / `.gen_range()` are matched — see the precision caveat in
-/// the module docs.
+/// Classify a method call by its method name. Only the `rand` idioms `.gen()` /
+/// `.gen_range()` are matched. By name, so a user `builder.gen()` is flagged
+/// too (an accepted false positive — see the module docs).
 fn classify_method(method: &str) -> Option<Category> {
     match method {
         "gen" | "gen_range" => Some(Category::Random),
         _ => None,
-    }
-}
-
-/// Classify a path ending in `OsRng` used as a value / receiver expression.
-/// Hard `Random` only for the exact fully-qualified `rand::rngs::OsRng`; any
-/// other path (bare `OsRng`, a `my_crate::rngs::OsRng`, an enum variant
-/// `Source::OsRng`, …) is low-confidence `PossibleRandom` — no resolution.
-fn classify_os_rng_path(segs: &[String]) -> Category {
-    if segs.len() == 3 && segs[0] == "rand" && segs[1] == "rngs" && segs[2] == "OsRng" {
-        Category::Random
-    } else {
-        Category::PossibleRandom
     }
 }
 
@@ -343,18 +341,8 @@ impl<'ast> Visit<'ast> for LeakVisitor<'_> {
                 .iter()
                 .map(|s| s.ident.to_string())
                 .collect();
-            let n = segs.len();
             if let Some(cat) = classify_call(&segs) {
                 self.record(cat, node.span());
-            } else if n == 1 && segs[0] == "thread_rng" {
-                // Bare `thread_rng()` — no `rand::` qualifier, so we cannot prove
-                // it is rand's without name resolution. Low-confidence.
-                self.record(Category::PossibleRandom, node.span());
-            } else if n >= 1 && segs[n - 1] == "from_entropy" {
-                // `<receiver>::from_entropy()` that is NOT fully-qualified `rand`
-                // (that case is caught by `classify_call`). Shaped like the RNG
-                // seeding idiom but unproven — low-confidence.
-                self.record(Category::PossibleRandom, node.span());
             }
         }
         visit::visit_expr_call(self, node);
@@ -371,20 +359,15 @@ impl<'ast> Visit<'ast> for LeakVisitor<'_> {
     }
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-        // `OsRng` used as a bare VALUE/path expression — bound to a local
-        // (`let mut rng = rand::rngs::OsRng;`), used as a receiver
-        // (`rand::rngs::OsRng.next_u64()`), or passed by value. Hard `Random`
-        // only for the fully-qualified `rand::rngs::OsRng`; every other spelling
-        // is `PossibleRandom` (no resolution). A call-form assoc access like
-        // `OsRng::default` ends in `default`, so it is NOT matched here.
-        let idents: Vec<String> = node
-            .path
-            .segments
-            .iter()
-            .map(|s| s.ident.to_string())
-            .collect();
-        if idents.last().map(String::as_str) == Some("OsRng") {
-            self.record(classify_os_rng_path(&idents), node.span());
+        // `OsRng` used as a VALUE/path expression — bound to a local
+        // (`let mut rng = OsRng;`), used as a receiver (`OsRng.next_u64()`), or
+        // passed by value. Matched by tail name, so a bare imported `OsRng`, a
+        // fully-qualified `rand::rngs::OsRng`, and a same-named user
+        // `Source::OsRng` variant are all flagged (the last is an accepted false
+        // positive). The call form `OsRng::default()` ends in `default`, not
+        // `OsRng`, so it is handled by `classify_call`, not here.
+        if node.path.segments.last().map(|s| s.ident.to_string()) == Some("OsRng".to_string()) {
+            self.record(Category::Random, node.span());
         }
         visit::visit_expr_path(self, node);
     }
@@ -571,6 +554,75 @@ mod tests {
         ));
     }
 
+    // ── Bare / imported forms are ALSO flagged (name-based, err toward flag) ───
+
+    #[test]
+    fn bare_imported_os_rng_value_is_hard_random() {
+        // `use rand::rngs::OsRng; … let _r = OsRng;` — the import is gone from
+        // the AST, but the bare name resolves to the real RNG. Flag it.
+        let leaks = scan("fn f() { let _r = OsRng; }");
+        assert!(
+            has(&leaks, Category::Random, "OsRng"),
+            "bare OsRng value must be hard RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn bare_imported_thread_rng_call_is_hard_random() {
+        // `use rand::thread_rng; … thread_rng()` — flagged by name.
+        let leaks = scan("fn f() { let _ = thread_rng(); }");
+        assert!(
+            has(&leaks, Category::Random, "thread_rng"),
+            "bare thread_rng() must be hard RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn os_rng_default_call_form_is_hard_random() {
+        // Bug fix: the associated-fn CALL form `OsRng::default()` was dropped
+        // (its last segment is `default`, so the path visitor never saw it).
+        // Both the bare and fully-qualified spellings must be flagged, exactly
+        // once each, including when chained into `.next_u64()`.
+        for src in [
+            "fn f() { let _r = OsRng::default(); }",
+            "fn f() -> u64 { OsRng::default().next_u64() }",
+            "fn f() -> u64 { rand::rngs::OsRng::default().next_u64() }",
+        ] {
+            let leaks = scan(src);
+            let os: Vec<_> = leaks
+                .iter()
+                .filter(|l| l.category == Category::Random)
+                .collect();
+            assert_eq!(
+                os.len(),
+                1,
+                "OsRng::default() must be exactly one RANDOM leak in `{src}`: {leaks:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn receiver_from_entropy_is_hard_random() {
+        // `<receiver>::from_entropy()` on ANY receiver is flagged (the receiver
+        // segment is the signal it is an RNG constructor).
+        let leaks = scan("fn f() { let _ = Config::from_entropy(); }");
+        assert!(
+            has(&leaks, Category::Random, "from_entropy"),
+            "Config::from_entropy() must be hard RANDOM: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn bare_free_from_entropy_is_not_flagged() {
+        // Bug fix: a bare free `from_entropy()` (no receiver segment) carries no
+        // signal that it is an RNG constructor and must NOT be flagged.
+        let leaks = scan("fn f() { let _ = from_entropy(); }");
+        assert!(
+            leaks.is_empty(),
+            "bare free from_entropy() must NOT be flagged: {leaks:#?}"
+        );
+    }
+
     #[test]
     fn fully_qualified_os_rng_is_flagged_exactly_once() {
         // The receiver form must be flagged, and not double-counted.
@@ -582,85 +634,77 @@ mod tests {
         assert_eq!(os.len(), 1, "expected exactly one OsRng leak: {leaks:#?}");
     }
 
-    // ── Bare / aliased idioms → POSSIBLE-RANDOM, never hard ───────────────────
+    // ── Accepted false positives (name-based ⇒ same-named user symbols flag) ───
+    //
+    // These lock the honest contract: the scanner matches by name, so user
+    // symbols that share a determinism-source name ARE flagged. That is the
+    // intended, safe-direction behavior for a replay-safety gate — not a bug.
 
     #[test]
-    fn bare_os_rng_is_possible_random_not_hard() {
-        let leaks = scan("fn f() { let _r = OsRng; }");
+    fn accepted_fp_user_system_time_now() {
+        // `my_time::SystemTime::now()` — a user type named `SystemTime` with a
+        // `now` assoc fn. Matched on the `SystemTime::now` tail → flagged.
+        let leaks = scan("fn f() { my_time::SystemTime::now(); }");
         assert!(
-            !any_of(&leaks, Category::Random),
-            "bare OsRng must not be hard RANDOM: {leaks:#?}"
-        );
-        assert!(
-            any_of(&leaks, Category::PossibleRandom),
-            "bare OsRng should be POSSIBLE-RANDOM: {leaks:#?}"
+            has(&leaks, Category::Time, "SystemTime::now"),
+            "same-named user SystemTime::now() IS flagged (accepted FP): {leaks:#?}"
         );
     }
 
     #[test]
-    fn bare_thread_rng_is_possible_random_not_hard() {
-        let leaks = scan("fn f() { let _ = thread_rng(); }");
+    fn accepted_fp_user_gen_method() {
+        // `builder.gen()` — a user builder with a `gen()` method. Matched on the
+        // `.gen()` method name → flagged.
+        let leaks = scan("fn f() { builder.gen(); }");
         assert!(
-            !any_of(&leaks, Category::Random),
-            "bare thread_rng must not be hard RANDOM: {leaks:#?}"
-        );
-        assert!(
-            any_of(&leaks, Category::PossibleRandom),
-            "bare thread_rng should be POSSIBLE-RANDOM: {leaks:#?}"
+            any_of(&leaks, Category::Random),
+            "same-named user .gen() IS flagged (accepted FP): {leaks:#?}"
         );
     }
 
     #[test]
-    fn bare_from_entropy_is_possible_random_not_hard() {
-        // `Config::from_entropy()` — shaped like the RNG idiom on an unrecognized
-        // receiver, not fully-qualified rand → POSSIBLE-RANDOM.
-        let leaks = scan("fn f() { let _ = Config::from_entropy(); }");
-        assert!(
-            !any_of(&leaks, Category::Random),
-            "Config::from_entropy must not be hard RANDOM: {leaks:#?}"
-        );
-        assert!(
-            any_of(&leaks, Category::PossibleRandom),
-            "Config::from_entropy should be POSSIBLE-RANDOM: {leaks:#?}"
-        );
-    }
-
-    // ── Non-rand look-alikes → NOT hard ───────────────────────────────────────
-
-    #[test]
-    fn enum_variant_os_rng_is_not_hard() {
-        // `enum Source { OsRng }` then `Source::OsRng` — a user enum variant that
-        // merely shares the name must NOT be a hard RANDOM false positive.
-        let leaks = scan("enum Source { OsRng } fn f() -> Source { Source::OsRng }");
-        assert!(
-            !any_of(&leaks, Category::Random),
-            "Source::OsRng variant must not be hard RANDOM: {leaks:#?}"
-        );
-    }
-
-    #[test]
-    fn foreign_rngs_os_rng_is_not_hard() {
-        // `my_crate::rngs::OsRng` shares the `rngs::OsRng` tail but is NOT the
-        // real generator — the exact path is `rand::rngs::OsRng`.
-        let leaks = scan("fn f() { let _r = my_crate::rngs::OsRng; }");
-        assert!(
-            !any_of(&leaks, Category::Random),
-            "my_crate::rngs::OsRng must NOT be hard RANDOM: {leaks:#?}"
-        );
-        assert!(
-            has(&leaks, Category::PossibleRandom, "OsRng"),
-            "my_crate::rngs::OsRng should be POSSIBLE-RANDOM: {leaks:#?}"
-        );
-    }
-
-    #[test]
-    fn qualified_non_rand_thread_rng_is_not_flagged() {
-        // A user module's own `my_utils::thread_rng()` is qualified but not
-        // `rand`'s, and not bare — so it is not flagged at all.
+    fn foreign_qualified_thread_rng_is_not_flagged() {
+        // A clearly foreign-qualified `my_utils::thread_rng()` is NOT flagged —
+        // the distinctive name lets us skip the obvious false positive.
         let leaks = scan("fn f() { let _ = my_utils::thread_rng(); }");
         assert!(
+            !has(&leaks, Category::Random, "thread_rng"),
+            "foreign my_utils::thread_rng() must not be flagged: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn bare_thread_rng_is_flagged() {
+        // A bare `thread_rng()` (likely a `use rand::thread_rng`) IS flagged.
+        let leaks = scan("fn f() { let _ = thread_rng(); }");
+        assert!(
+            has(&leaks, Category::Random, "thread_rng"),
+            "bare thread_rng() must be flagged: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn accepted_fp_user_os_rng_variant() {
+        // `enum Source { OsRng }` then `Source::OsRng` — a user enum variant that
+        // shares the name IS flagged (accepted FP): matching is by tail name.
+        let leaks = scan("enum Source { OsRng } fn f() -> Source { Source::OsRng }");
+        assert!(
+            any_of(&leaks, Category::Random),
+            "user Source::OsRng variant IS flagged (accepted FP): {leaks:#?}"
+        );
+    }
+
+    // ── Documented false negatives (renamed imports slip through) ──────────────
+
+    #[test]
+    fn renamed_import_is_a_documented_false_negative() {
+        // `use std::time::SystemTime as Sys; Sys::now()` — the alias hides the
+        // recognizable name, so it is NOT flagged. Documented limitation: no
+        // name resolution.
+        let leaks = scan("fn f() { Sys::now(); }");
+        assert!(
             leaks.is_empty(),
-            "qualified non-rand thread_rng must not be flagged: {leaks:#?}"
+            "aliased Sys::now() is a documented false negative (not flagged): {leaks:#?}"
         );
     }
 }

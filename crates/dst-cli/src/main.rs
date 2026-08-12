@@ -32,13 +32,15 @@ struct Cli {
 enum Commands {
     /// Scan Rust source for determinism leaks (time, random, network, concurrency).
     ///
-    /// A SYNTACTIC heuristic, not a sound analyzer: it matches fully-qualified
-    /// determinism sources (e.g. `rand::rngs::OsRng`, `std::time::SystemTime::
-    /// now`) with NO name resolution. Bare or aliased idioms (a bare `OsRng` /
-    /// `thread_rng()`, or an import renamed via `use ... as`) are reported as
-    /// lower-confidence `POSSIBLE-RANDOM`, not hard leaks — so real leaks reached
-    /// through such imports can be MISSED. Fully-qualify the source, or use
-    /// `--deny-possible`, for stricter gating.
+    /// A NAME-BASED heuristic, not a sound analyzer: it flags calls and paths
+    /// whose recognizable name or tail segments match a known determinism source
+    /// (e.g. `SystemTime::now`, `thread_rng`, `OsRng`, `tokio::spawn`). It does
+    /// NO name resolution, so it MAY false-positive on same-named user symbols
+    /// (`my_time::SystemTime::now()`, `builder.gen()`) and MAY false-negative on
+    /// renamed imports (`use ... as Sys; Sys::now()`). It errs toward flagging,
+    /// which is the right default for a replay-safety gate — a clean scan is a
+    /// prompt to review, not a proof of determinism. The `migrate` codemod is a
+    /// separate, conservative pass.
     Scan {
         /// Directory (or file) to scan. Defaults to the current directory.
         #[arg(default_value = ".")]
@@ -48,16 +50,10 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Exit non-zero if any HARD leak is found (time/random/network/
-        /// concurrency) — turns `scan` into a CI gate. Low-confidence
-        /// POSSIBLE-RANDOM findings do NOT fail the gate; add `--deny-possible`
-        /// to include them.
+        /// Exit non-zero if any leak is found (time/random/network/concurrency)
+        /// — turns `scan` into a CI gate.
         #[arg(long)]
         deny: bool,
-
-        /// With `--deny`, also fail on low-confidence POSSIBLE-RANDOM findings.
-        #[arg(long)]
-        deny_possible: bool,
     },
 
     /// Rewrite a conservative, seam-safe subset of determinism leaks so the
@@ -85,25 +81,16 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Scan {
-            path,
-            json,
-            deny,
-            deny_possible,
-        } => {
+        Commands::Scan { path, json, deny } => {
             let report = scan_path(&path);
             if json {
                 emit_json(&report);
             } else {
                 emit_human(&report);
             }
-            // The gate fails only on HARD leaks; POSSIBLE-RANDOM is opt-in via
-            // `--deny-possible` so a low-confidence finding never breaks CI.
-            let gate_hit = report
-                .leaks
-                .iter()
-                .any(|l| l.category.is_hard() || deny_possible);
-            if deny && gate_hit {
+            // Every category is a hard, gate-failing leak — the scanner errs
+            // toward flagging, so `--deny` fails whenever anything is found.
+            if deny && !report.leaks.is_empty() {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
@@ -233,10 +220,6 @@ fn emit_human(report: &ScanReport) {
         Category::Random,
         Category::Network,
         Category::Concurrency,
-        // Low-confidence; listed last and clearly marked so it is never mistaken
-        // for a hard leak — but it MUST be shown, or its count in the summary
-        // line would refer to nothing.
-        Category::PossibleRandom,
     ];
 
     println!("== Determinism leaks ==\n");
@@ -250,12 +233,7 @@ fn emit_human(report: &ScanReport) {
         if hits.is_empty() {
             continue;
         }
-        let confidence = if cat.is_hard() {
-            ""
-        } else {
-            "  [low confidence — review; not failed by --deny]"
-        };
-        println!("{} ({}){confidence}", cat.label(), hits.len());
+        println!("{} ({})", cat.label(), hits.len());
         for leak in hits {
             let loc = format!("{}:{}", leak.file, leak.line);
             let in_fn = match &leak.func {
@@ -288,13 +266,12 @@ fn emit_human(report: &ScanReport) {
     }
     println!(
         "{} leak(s) across {} file(s) \
-         ({} time, {} random, {} network, {} concurrency, {} possible-random [low confidence]).",
+         ({} time, {} random, {} network, {} concurrency).",
         report.leaks.len(),
         files.len(),
         count(Category::Time),
         count(Category::Random),
         count(Category::Network),
         count(Category::Concurrency),
-        count(Category::PossibleRandom),
     );
 }
