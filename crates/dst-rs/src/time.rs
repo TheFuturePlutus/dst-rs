@@ -15,6 +15,17 @@ use tokio::sync::watch;
 /// to wait for a duration goes through this trait. Production builds use
 /// [`ProductionTime`] (real OS time); simulation builds use
 /// [`SimulatedTime`] (harness-controlled clock).
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::{Time, SimulatedTime};
+///
+/// let clock = SimulatedTime::new(1_000);
+/// assert_eq!(clock.now_ms(), 1_000);
+/// clock.advance_ms(500);
+/// assert_eq!(clock.now_ms(), 1_500);
+/// ```
 #[async_trait::async_trait]
 pub trait Time: Send + Sync + 'static {
     /// Current wall-clock time in milliseconds since the Unix epoch.
@@ -74,13 +85,24 @@ impl Time for ProductionTime {
 /// Simulation-mode `Time` — harness-controlled clock.
 ///
 /// The clock starts at `start_ms` (Unix epoch milliseconds). The harness
-/// calls [`SimulatedTime::advance`] or [`SimulatedTime::set_to`] to move
+/// calls [`SimulatedTime::advance_ms`] or [`SimulatedTime::set_to_ms`] to move
 /// the clock forward; sleepers waiting on the clock wake when the clock
 /// passes their deadline.
 ///
 /// Internally uses a `tokio::sync::watch` channel so that multiple advances
 /// in quick succession coalesce — sleepers always observe the latest value
 /// and there is no missed-wakeup race.
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::SimulatedTime;
+///
+/// let clock = SimulatedTime::new(0);
+/// clock.advance_ms(250);
+/// clock.set_to_ms(42_000);
+/// assert_eq!(clock.current_ms(), 42_000);
+/// ```
 pub struct SimulatedTime {
     /// Real `Instant` captured at construction; used to synthesize
     /// monotonic instants that track the simulated clock.

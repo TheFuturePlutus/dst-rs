@@ -6,6 +6,8 @@
 //! network, and unstructured concurrency APIs — the sources of non-determinism
 //! that break replay-based testing.
 
+#![warn(missing_docs)]
+
 mod migrate;
 mod scanner;
 

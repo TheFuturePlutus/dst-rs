@@ -2,6 +2,7 @@
 name = "dst-cli"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 license = "Apache-2.0"
 description = "Command-line tools for the dst-rs deterministic-simulation-testing substrate: a determinism-leak scanner and a seam-safe time-migration rewriter."
 repository = "https://github.com/navian-ai/dst-rs"

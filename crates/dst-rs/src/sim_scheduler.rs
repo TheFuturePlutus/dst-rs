@@ -86,6 +86,23 @@ impl Wake for TaskWaker {
 }
 
 /// A deterministic single-thread async executor with a virtual clock.
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::SimScheduler;
+/// use std::cell::Cell;
+/// use std::rc::Rc;
+///
+/// let ran = Rc::new(Cell::new(false));
+/// let flag = ran.clone();
+///
+/// let mut sched = SimScheduler::new();
+/// sched.spawn(async move { flag.set(true); });
+/// sched.run(); // drives every spawned task to completion, deterministically
+///
+/// assert!(ran.get());
+/// ```
 pub struct SimScheduler {
     next_id: u64,
     tasks: HashMap<u64, LocalFuture>,
@@ -100,6 +117,7 @@ impl Default for SimScheduler {
 }
 
 impl SimScheduler {
+    /// Create an empty scheduler with no spawned tasks and a zeroed step count.
     pub fn new() -> Self {
         Self {
             next_id: 0,

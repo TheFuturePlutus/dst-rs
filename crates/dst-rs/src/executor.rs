@@ -15,6 +15,7 @@ use super::time::Time;
 
 /// Marker for a future that did not complete within the given duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "TimedOut signals the operation did not finish and must be handled"]
 pub struct TimedOut;
 
 impl std::fmt::Display for TimedOut {
@@ -131,6 +132,7 @@ impl Default for SimulatedExecutor {
 }
 
 impl SimulatedExecutor {
+    /// Create an executor with a zeroed spawn counter.
     pub fn new() -> Self {
         Self {
             spawned: Mutex::new(0),

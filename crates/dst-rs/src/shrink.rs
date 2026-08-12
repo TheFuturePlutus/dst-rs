@@ -25,6 +25,18 @@
 /// Deterministic: the same input and (deterministic) predicate always yield the
 /// same minimal set. Complexity is polynomial in the input length, not exponential
 /// — worst case O(n²) predicate evaluations.
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::ddmin;
+///
+/// // The failure reproduces only when the poison value 42 is present.
+/// let input: Vec<i32> = (30..50).collect();
+/// let minimal = ddmin(&input, |subset| subset.contains(&42));
+/// assert_eq!(minimal, vec![42]);
+/// ```
+#[must_use = "ddmin returns the minimized failing subset; dropping it discards the shrink result"]
 pub fn ddmin<T, F>(input: &[T], mut reproduces: F) -> Vec<T>
 where
     T: Clone,

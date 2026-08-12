@@ -31,11 +31,17 @@ pub trait Network: Send + Sync + 'static {}
 /// (`Delayed` still arrived, just late); `Failed`/`Dropped` are non-deliveries a
 /// correct caller must retry or time out on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Delivery<T> {
     /// Delivered immediately, on a clear link.
     Delivered(T),
     /// Delivered, but only after `delay_ms` of simulated delay (clock skew).
-    Delayed { value: T, delay_ms: u64 },
+    Delayed {
+        /// The payload that eventually arrived.
+        value: T,
+        /// How long, in simulated milliseconds, the payload was delayed.
+        delay_ms: u64,
+    },
     /// Transient link/peer error — nothing arrived; the caller should retry.
     Failed,
     /// Silently dropped — no response arrives at all; the caller must time out.

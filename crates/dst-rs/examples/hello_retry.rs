@@ -44,7 +44,9 @@ fn retrying_client(net: &SimulatedNetwork, max_attempts: u32) -> CallResult {
             // Transient failure or a silent drop: back off and retry. Under the
             // deterministic scheduler a backoff sleep costs no wall-clock time; here
             // we simply advance to the next attempt (and the next schedule step).
-            Delivery::Failed | Delivery::Dropped => continue,
+            // `Delivery` is `#[non_exhaustive]`; treat any future non-delivery
+            // outcome conservatively as retryable.
+            _ => continue,
         }
     }
     CallResult {

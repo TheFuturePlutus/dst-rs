@@ -32,3 +32,18 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  msrv:
+    name: msrv (1.87.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust 1.87.0
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check on MSRV
+        run: cargo check --workspace --all-targets

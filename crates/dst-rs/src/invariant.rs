@@ -23,11 +23,13 @@
 /// stale. Keep cross-step state outside the predicate set, or use
 /// [`InvariantEngine::check_all`] (which always evaluates every invariant).
 pub struct Invariant<S> {
+    /// Human-readable name reported in a [`Violation`] when this check fails.
     pub name: &'static str,
     holds: Box<dyn Fn(&S) -> bool>,
 }
 
 impl<S> Invariant<S> {
+    /// Build a named invariant from a predicate over the state `S`.
     pub fn new(name: &'static str, holds: impl Fn(&S) -> bool + 'static) -> Self {
         Self {
             name,
@@ -38,8 +40,11 @@ impl<S> Invariant<S> {
 
 /// A violated invariant: which one, and the step index at which it first broke.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "a Violation reports a DST failure and should be acted on, not dropped"]
 pub struct Violation {
+    /// The simulation step index at which the invariant first broke.
     pub step: usize,
+    /// The name of the invariant that was violated.
     pub invariant: &'static str,
 }
 
@@ -50,6 +55,7 @@ pub struct InvariantEngine<S> {
 }
 
 impl<S> InvariantEngine<S> {
+    /// Build an engine that checks `invariants` in declaration order.
     pub fn new(invariants: Vec<Invariant<S>>) -> Self {
         Self { invariants }
     }
@@ -81,10 +87,12 @@ impl<S> InvariantEngine<S> {
             .collect()
     }
 
+    /// The number of invariants this engine checks.
     pub fn len(&self) -> usize {
         self.invariants.len()
     }
 
+    /// Whether the engine holds no invariants (checks are a no-op).
     pub fn is_empty(&self) -> bool {
         self.invariants.is_empty()
     }

@@ -29,6 +29,17 @@ use uuid::Uuid;
 /// through this trait. Production builds use [`ProductionRandom`] (real
 /// thread-local entropy); simulation builds use [`SimulatedRandom`]
 /// (seeded ChaCha20, fully deterministic).
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::{Random, SimulatedRandom};
+///
+/// // Same seed ⇒ same stream: the replay guarantee.
+/// let a = SimulatedRandom::from_seed(42);
+/// let b = SimulatedRandom::from_seed(42);
+/// assert_eq!(a.next_u64(), b.next_u64());
+/// ```
 pub trait Random: Send + Sync + 'static {
     /// Next pseudo-random `u64`.
     fn next_u64(&self) -> u64;
@@ -80,6 +91,16 @@ impl Random for ProductionRandom {
 /// Same seed produces identical sequences. UUIDs are constructed from
 /// `(rng_state, counter)` so they're unique within a run but reproducible
 /// across runs from the same seed.
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::{Random, SimulatedRandom};
+///
+/// let rng = SimulatedRandom::from_seed(7);
+/// // Deterministic UUIDs: distinct per call, reproducible across runs.
+/// assert_ne!(rng.next_uuid(), rng.next_uuid());
+/// ```
 pub struct SimulatedRandom {
     rng: Mutex<ChaCha20Rng>,
     uuid_counter: AtomicU64,

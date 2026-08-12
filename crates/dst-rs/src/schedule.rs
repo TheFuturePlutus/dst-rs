@@ -21,6 +21,7 @@ use crate::Random;
 
 /// A fault to inject before a given simulation step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Fault {
     /// No fault this step — the common case.
     None,
@@ -43,6 +44,18 @@ impl Fault {
 /// The whole timeline is materialized up front from the seed, so it is fully
 /// replayable and inspectable (you can print the exact fault sequence that broke a
 /// run, then feed the step indices to `ddmin`).
+///
+/// # Examples
+///
+/// ```
+/// use dst_rs::FaultSchedule;
+///
+/// // Same seed ⇒ identical timeline; ~30% of 200 steps carry a fault.
+/// let a = FaultSchedule::generate(123, 200, 30);
+/// let b = FaultSchedule::generate(123, 200, 30);
+/// assert_eq!(a.fault_steps(), b.fault_steps());
+/// assert!(a.fault_count() > 0);
+/// ```
 #[derive(Clone, Debug)]
 pub struct FaultSchedule {
     faults: Vec<Fault>,
@@ -124,10 +137,12 @@ impl FaultSchedule {
         self.faults.get(step).copied().unwrap_or(Fault::None)
     }
 
+    /// The number of steps in the schedule (including quiescent `None` steps).
     pub fn len(&self) -> usize {
         self.faults.len()
     }
 
+    /// Whether the schedule has zero steps.
     pub fn is_empty(&self) -> bool {
         self.faults.is_empty()
     }
@@ -149,6 +164,7 @@ impl FaultSchedule {
             .collect()
     }
 
+    /// Iterate over the per-step faults in step order.
     pub fn iter(&self) -> impl Iterator<Item = &Fault> {
         self.faults.iter()
     }

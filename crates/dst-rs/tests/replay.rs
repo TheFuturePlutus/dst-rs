@@ -28,6 +28,8 @@ fn run_workload(seed: u64) -> Vec<(u64, u8)> {
                 dst_rs::Delivery::Delayed { .. } => 1,
                 dst_rs::Delivery::Failed => 2,
                 dst_rs::Delivery::Dropped => 3,
+                // `Delivery` is `#[non_exhaustive]`; no other outcomes exist today.
+                _ => 4,
             };
             (draw, tag)
         })

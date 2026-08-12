@@ -33,6 +33,8 @@
 //! - [`InvariantEngine`] — a generic, step-aware invariant checker
 //! - [`ddmin`] — delta-debugging trace shrinker
 
+#![warn(missing_docs)]
+
 pub mod executor;
 pub mod invariant;
 pub mod network;

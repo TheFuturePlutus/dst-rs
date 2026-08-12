@@ -75,6 +75,8 @@ fn injected_faults_are_observable_through_the_network() {
                 assert!(matches!(got, Delivery::Delayed { .. }), "step {step}");
                 assert_eq!(got.delay_ms(), ms.unsigned_abs(), "step {step}");
             }
+            // `Fault` is `#[non_exhaustive]`; `generate` only emits the kinds above.
+            other => unreachable!("unexpected fault kind {other:?} at step {step}"),
         }
     }
     // Rebuilding the network from the same schedule replays the same outcomes.

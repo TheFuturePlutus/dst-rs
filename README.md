@@ -3,7 +3,12 @@
 **Deterministic simulation testing for Rust — replay any run from a seed, inject faults, and auto-shrink failures to a minimal reproducer.**
 
 [![CI](https://github.com/navian-ai/dst-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/navian-ai/dst-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/dst-rs.svg)](https://crates.io/crates/dst-rs)
+[![docs.rs](https://img.shields.io/docsrs/dst-rs)](https://docs.rs/dst-rs)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+
+> The crates.io and docs.rs badges go live with the `v0.1.0` release; until the
+> crate is published they will show as "not found".
 
 Concurrent and async bugs are the ones that pass every test and then page you at
 3am: they need a crash, a reorder, or a dropped packet to land in a microsecond
