@@ -31,6 +31,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Scan Rust source for determinism leaks (time, random, network, concurrency).
+    ///
+    /// A SYNTACTIC heuristic, not a sound analyzer: it matches fully-qualified
+    /// determinism sources (e.g. `rand::rngs::OsRng`, `std::time::SystemTime::
+    /// now`) with NO name resolution. Bare or aliased idioms (a bare `OsRng` /
+    /// `thread_rng()`, or an import renamed via `use ... as`) are reported as
+    /// lower-confidence `POSSIBLE-RANDOM`, not hard leaks — so real leaks reached
+    /// through such imports can be MISSED. Fully-qualify the source, or use
+    /// `--deny-possible`, for stricter gating.
     Scan {
         /// Directory (or file) to scan. Defaults to the current directory.
         #[arg(default_value = ".")]
