@@ -1881,7 +1881,10 @@ impl Foo {
 }
 "#;
         let r = plan(src);
-        assert!(r.no_op, "`::navian_dst::Time` must read as already-migrated");
+        assert!(
+            r.no_op,
+            "`::navian_dst::Time` must read as already-migrated"
+        );
         assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
     }
 
