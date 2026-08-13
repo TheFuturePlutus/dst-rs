@@ -50,4 +50,4 @@ the `dst` CLI, and the AI-native install layer.
   it scans, migrates the time seams, hand-finishes the leaks the tool skips, and
   scaffolds a seed-loop DST test — keeping the tree compiling at every step.
 
-[0.1.0]: https://github.com/navian-ai/dst-rs/releases/tag/v0.1.0
+[0.1.0]: https://github.com/TheFuturePlutus/dst-rs/releases/tag/v0.1.0

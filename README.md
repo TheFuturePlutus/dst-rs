@@ -2,7 +2,7 @@
 
 **Deterministic simulation testing for Rust — replay any run from a seed, inject faults, and auto-shrink failures to a minimal reproducer.**
 
-[![CI](https://github.com/navian-ai/dst-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/navian-ai/dst-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/TheFuturePlutus/dst-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/TheFuturePlutus/dst-rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/dst-rs.svg)](https://crates.io/crates/dst-rs)
 [![docs.rs](https://img.shields.io/docsrs/dst-rs)](https://docs.rs/dst-rs)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)

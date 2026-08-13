@@ -99,7 +99,7 @@ cargo test   # lib unit tests + replay / faults / shrinking / catches_planted_bu
 
 The mechanical refactor of threading a clock/RNG/network through an existing
 codebase is exactly what a coding agent does perfectly. The
-[dst-rs project](https://github.com/navian-ai/dst-rs) ships an **AI-native install
+[dst-rs project](https://github.com/TheFuturePlutus/dst-rs) ships an **AI-native install
 layer** (`/dst-init` for Claude Code, a rule for Cursor) plus the **`dst` CLI**
 (`dst scan` + `dst migrate`) that does it for you — scan the leaks, rewrite the
 time seams, scaffold a seed-loop test. See the project README for the full flow.

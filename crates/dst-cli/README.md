@@ -43,12 +43,12 @@ dst migrate              # apply, then run `cargo check` (auto-restores on failu
 After applying, `migrate` runs `cargo check`; if it fails, the original files are
 restored. Anything it cannot map cleanly (free functions, random/network/
 concurrency leaks) is left untouched and reported under "Skipped (manual / agent
-needed)" — that's where the [`dst-init`](https://github.com/navian-ai/dst-rs) AI
+needed)" — that's where the [`dst-init`](https://github.com/TheFuturePlutus/dst-rs) AI
 install layer takes over.
 
 ## Part of dst-rs
 
-This crate is one piece of the [dst-rs](https://github.com/navian-ai/dst-rs)
+This crate is one piece of the [dst-rs](https://github.com/TheFuturePlutus/dst-rs)
 project. Start there for the substrate, the examples, and the `/dst-init`
 agent-driven install flow.
 
