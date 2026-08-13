@@ -29,7 +29,7 @@ the `dst` CLI, and the AI-native install layer.
 - Two runnable examples (`hello_retry`, `kv_chaos`) and a credibility test
   (`catches_planted_bug`) that finds a planted durability bug and shrinks it to a
   single `CrashRestart`.
-- 74 tests.
+- 95 tests.
 
 ### `dst-cli` — command-line tools (`dst` binary)
 
@@ -41,7 +41,7 @@ the `dst` CLI, and the AI-native install layer.
   production clock) and routes TIME leak call sites through it. Runs `cargo check`
   after applying and auto-restores the originals on failure. `--dry-run` prints a
   unified diff.
-- 18 tests.
+- 54 tests.
 
 ### AI-native install layer (`plugin/`, `.cursor/rules/`)
 
