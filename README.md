@@ -202,7 +202,7 @@ docs/         # launch blog post and design notes
 ## Testing
 
 ```bash
-cargo test --workspace     # dst-rs (74) + dst-cli (18)
+cargo test --workspace     # dst-rs (95) + dst-cli (54)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
