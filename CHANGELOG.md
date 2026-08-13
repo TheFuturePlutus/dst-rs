@@ -7,10 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] — initial release
 
-First public release of the `dst-rs` deterministic-simulation-testing substrate,
-the `dst` CLI, and the AI-native install layer.
+First public release of the `navian-dst` deterministic-simulation-testing substrate,
+the `navian-dst` CLI, and the AI-native install layer.
 
-### `dst-rs` — the DST substrate (library)
+### `navian-dst` — the DST substrate (library)
 
 - **Deterministic non-determinism traits.** `Time`, `Random`, `Network`, and
   `Executor` each ship a zero-overhead production impl (direct `std`/`tokio`/
@@ -31,13 +31,13 @@ the `dst` CLI, and the AI-native install layer.
   single `CrashRestart`.
 - 95 tests.
 
-### `dst-cli` — command-line tools (`dst` binary)
+### `navian-dst-cli` — command-line tools (`navian-dst` binary)
 
-- **`dst scan`** — a static determinism-leak detector (syn-based) that finds calls
+- **`navian-dst scan`** — a static determinism-leak detector (syn-based) that finds calls
   into wall-clock time, RNG, network, and unstructured-concurrency APIs. Human and
   `--json` output; `--deny` turns it into a CI gate.
-- **`dst migrate`** — a conservative, seam-safe rewriter that injects
-  `time: Arc<dyn dst_rs::Time>` into named-field structs (defaulted to the
+- **`navian-dst migrate`** — a conservative, seam-safe rewriter that injects
+  `time: Arc<dyn navian_dst::Time>` into named-field structs (defaulted to the
   production clock) and routes TIME leak call sites through it. Runs `cargo check`
   after applying and auto-restores the originals on failure. `--dry-run` prints a
   unified diff.
@@ -50,4 +50,4 @@ the `dst` CLI, and the AI-native install layer.
   it scans, migrates the time seams, hand-finishes the leaks the tool skips, and
   scaffolds a seed-loop DST test — keeping the tree compiling at every step.
 
-[0.1.0]: https://github.com/TheFuturePlutus/dst-rs/releases/tag/v0.1.0
+[0.1.0]: https://github.com/TheFuturePlutus/navian-dst/releases/tag/v0.1.0

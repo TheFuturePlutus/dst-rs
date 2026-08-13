@@ -2,7 +2,7 @@
 /target
 **/target/
 
-# Backup / migration artifacts written by dst-cli during rewrites
+# Backup / migration artifacts written by navian-dst-cli during rewrites
 *.bak
 *.orig
 *.rs.dst-bak

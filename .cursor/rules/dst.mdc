@@ -1,22 +1,22 @@
 ---
-description: Make a Rust crate deterministically testable with dst-rs. When the user asks to make a crate replayable / deterministically testable / fault-injectable, drive the dst-cli scan + migrate tools, hand-finish the leaks migrate skips, and scaffold a seed-loop DST test — keeping the tree compiling at every step.
+description: Make a Rust crate deterministically testable with navian-dst. When the user asks to make a crate replayable / deterministically testable / fault-injectable, drive the navian-dst-cli scan + migrate tools, hand-finish the leaks migrate skips, and scaffold a seed-loop DST test — keeping the tree compiling at every step.
 globs: ["**/*.rs", "**/Cargo.toml"]
 alwaysApply: false
 ---
 
-# Make this crate deterministically testable (dst-rs)
+# Make this crate deterministically testable (navian-dst)
 
 When the user asks to "make this crate deterministically testable" (or
 replayable / fault-injectable), follow this playbook. You drive the already-built
-`dst-cli` tools (`dst scan`, `dst migrate`) and hand-finish what they skip. Do
-**not** write new tooling; do **not** invent CLI flags or `dst-rs` methods.
+`navian-dst-cli` tools (`navian-dst scan`, `navian-dst migrate`) and hand-finish what they skip. Do
+**not** write new tooling; do **not** invent CLI flags or `navian-dst` methods.
 
-The binary is `dst` (crate `dst-cli`); in-repo run it as
-`cargo run -q -p dst-cli --`.
+The binary is `navian-dst` (crate `navian-dst-cli`); in-repo run it as
+`cargo run -q -p navian-dst-cli --`.
 
 ## Prime rule: the tree compiles at every step
 
-Every step is seam-safe. `dst migrate` adds a `time` field defaulted to the
+Every step is seam-safe. `navian-dst migrate` adds a `time` field defaulted to the
 production clock, so existing callers are unchanged. Migrate one struct at a
 time, `cargo check` after each edit, and **prefer a false negative** (leave a
 leak, report it) **over a wrong rewrite**. Never commit a red tree.
@@ -24,36 +24,36 @@ leak, report it) **over a wrong rewrite**. Never commit a red tree.
 ## Step 1 — Scan
 
 ```bash
-dst scan --json <path>     # array of {file,line,col,category,snippet,fn}
-dst scan <path>            # human summary
+navian-dst scan --json <path>     # array of {file,line,col,category,snippet,fn}
+navian-dst scan <path>            # human summary
 ```
 
 Categories: `time`, `random`, `network`, `concurrency`. Summarize the counts to
 the user. `--deny` turns scan into a non-zero CI gate.
 
-## Step 2 — Ensure dst-rs is a dependency (before migrate)
+## Step 2 — Ensure navian-dst is a dependency (before migrate)
 
-`dst migrate` runs `cargo check` after rewriting and **auto-restores if it
-fails**; the rewrites reference `dst_rs::Time` / `dst_rs::ProductionTime`, so a
+`navian-dst migrate` runs `cargo check` after rewriting and **auto-restores if it
+fails**; the rewrites reference `navian_dst::Time` / `navian_dst::ProductionTime`, so a
 crate without the dep produces no change. Add it first:
 
 ```bash
-cargo add dst-rs --manifest-path <crate>/Cargo.toml          # runtime use
-# cargo add dst-rs --dev --manifest-path <crate>/Cargo.toml  # test-only use
+cargo add navian-dst --manifest-path <crate>/Cargo.toml          # runtime use
+# cargo add navian-dst --dev --manifest-path <crate>/Cargo.toml  # test-only use
 ```
 
-If dst-rs isn't published, add a path/workspace dependency by hand and confirm
+If navian-dst isn't published, add a path/workspace dependency by hand and confirm
 with `cargo check`.
 
 ## Step 3 — Migrate the time seams
 
 ```bash
-dst migrate --dry-run <path>   # unified diff, writes nothing
-dst migrate <path>             # applies, then runs cargo check
+navian-dst migrate --dry-run <path>   # unified diff, writes nothing
+navian-dst migrate <path>             # applies, then runs cargo check
 ```
 
 v1 rewrites TIME leaks in inherent methods of named-field structs only: adds
-`time: std::sync::Arc<dyn dst_rs::Time>` (defaulted to `dst_rs::ProductionTime`),
+`time: std::sync::Arc<dyn navian_dst::Time>` (defaulted to `navian_dst::ProductionTime`),
 and maps `SystemTime::now()…as_millis()` → `self.time.now_ms()`,
 `Instant::now()` → `self.time.instant_now()`, `tokio::time::sleep(d).await` →
 `self.time.sleep(d).await`. `--traits` accepts only `time` in v1. Report the
@@ -62,10 +62,10 @@ outcome).
 
 ## Step 4 — Hand-finish skipped leaks (same conventions)
 
-- **Free functions**: thread an explicit `time: &dyn dst_rs::Time` param and
+- **Free functions**: thread an explicit `time: &dyn navian_dst::Time` param and
   update callers (no `self` to hang a clock off).
 - **Random** (`rand::random`, `thread_rng`, `.gen`/`.gen_range`,
-  `Uuid::new_v4`, `fastrand`): add `rng: Arc<dyn dst_rs::Random>` defaulted to
+  `Uuid::new_v4`, `fastrand`): add `rng: Arc<dyn navian_dst::Random>` defaulted to
   `ProductionRandom`; route via `self.rng.next_u64()` / `next_uuid()` /
   `shuffle_u64()`.
 - **Network** (`reqwest`, `TcpStream`, `TcpListener`, tokio net): hide behind a
@@ -79,7 +79,7 @@ constructor (e.g. `with_time(tokens, Arc<dyn Time>)`) so tests can pass a
 
 ## Step 5 — Scaffold a seed-loop DST test
 
-Model it on `crates/dst-rs/examples/kv_chaos.rs`: inject `SimulatedTime`, loop
+Model it on `crates/navian-dst/examples/kv_chaos.rs`: inject `SimulatedTime`, loop
 seeds, build `FaultSchedule::generate(seed, steps, density)`, step through it,
 assert an invariant via `InvariantEngine`. Honor `SEED=<n>` for single-seed
 triage. Real API only: `SimulatedTime::new/advance_ms`,

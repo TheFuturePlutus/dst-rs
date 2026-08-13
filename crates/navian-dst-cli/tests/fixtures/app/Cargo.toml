@@ -1,0 +1,24 @@
+# Fixture crate for the `navian-dst migrate` integration test.
+#
+# This is a REAL, compiling crate that depends on navian-dst. The integration test
+# copies it to a temp dir, rewrites the `navian-dst` path to an absolute one, and
+# migrates the COPY — so this committed source stays pristine.
+#
+# The empty `[workspace]` table makes this its own workspace root so the parent
+# navian-dst workspace never tries to absorb it as a member.
+[workspace]
+
+[package]
+name = "app"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Rewritten to an absolute path by the integration test. The committed relative
+# path points at crates/navian-dst from this file's location.
+navian-dst = { path = "../../../../navian-dst" }
+tokio = { version = "1", features = ["time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["time", "rt", "macros"] }

@@ -1,13 +1,13 @@
-# Contributing to dst-rs
+# Contributing to navian-dst
 
-Thanks for your interest in improving `dst-rs`. This is a small, deliberately
+Thanks for your interest in improving `navian-dst`. This is a small, deliberately
 focused substrate for deterministic simulation testing (DST) in Rust — the bar
 for changes is high precisely because everything downstream relies on it being
 correct and reproducible.
 
 ## Building and testing
 
-The workspace has two crates: the `dst-rs` library and the `dst-cli` tooling.
+The workspace has two crates: the `navian-dst` library and the `navian-dst-cli` tooling.
 
 ```bash
 # Build everything
@@ -53,7 +53,7 @@ constraint shapes what a correct contribution looks like:
 - **No hidden non-determinism.** Anything that reads wall-clock time, draws
   randomness, talks to the network, or spawns tasks must go through the
   substrate traits (`Time`, `Random`, `Network`, `Executor`) so a simulation
-  build can control it. The `dst` CLI's `scan` subcommand exists to catch leaks.
+  build can control it. The `navian-dst` CLI's `scan` subcommand exists to catch leaks.
 - **Predicates and reproduction functions must be side-effect-free.** `ddmin`
   and the invariant engine call them many times over overlapping subsets; an
   observable side effect makes results build-profile-dependent.

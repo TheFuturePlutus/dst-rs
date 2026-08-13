@@ -1,10 +1,10 @@
-# dst-rs
+# navian-dst
 
 **Deterministic simulation testing for Rust — replay any run from a seed, inject faults, and auto-shrink failures to a minimal reproducer.**
 
-[![CI](https://github.com/TheFuturePlutus/dst-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/TheFuturePlutus/dst-rs/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/dst-rs.svg)](https://crates.io/crates/dst-rs)
-[![docs.rs](https://img.shields.io/docsrs/dst-rs)](https://docs.rs/dst-rs)
+[![CI](https://github.com/TheFuturePlutus/navian-dst/actions/workflows/ci.yml/badge.svg)](https://github.com/TheFuturePlutus/navian-dst/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/navian-dst.svg)](https://crates.io/crates/navian-dst)
+[![docs.rs](https://img.shields.io/docsrs/navian-dst)](https://docs.rs/navian-dst)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
 Concurrent and async bugs are the ones that pass every test and then page you at
@@ -13,21 +13,21 @@ window you can't reproduce on demand. Deterministic simulation testing (DST)
 takes control of the clock, the RNG, the network, and task scheduling, drives
 them all from a single seed, and injects faults on a reproducible timeline — so a
 failing run replays **bit-for-bit** and can be shrunk to the handful of events
-that actually caused it. `dst-rs` is a small, domain-agnostic substrate for doing
+that actually caused it. `navian-dst` is a small, domain-agnostic substrate for doing
 this in ordinary Rust: no forked runtime, no rewrite — you inject four traits and
 loop over seeds.
 
 ## Two things: a library, and a plugin that installs it
 
-- **`dst-rs`** (`crates/dst-rs`) — the DST substrate. The deterministic
+- **`navian-dst`** (`crates/navian-dst`) — the DST substrate. The deterministic
   clock/RNG/network/executor, a single-thread scheduler, seeded fault schedules,
   an invariant engine, and a delta-debugging shrinker.
 - **`dst-init`** (`plugin/`, `.cursor/rules/`) — the AI-native install layer.
   Point a coding agent (Claude Code or Cursor) at a Rust crate and it does the
   mechanical refactor for you: finds the determinism leaks, rewrites the time
   seams so your types become injectable, hand-finishes what the tool can't safely
-  touch, and scaffolds a seed-loop DST test. It drives the **`dst` CLI**
-  (`crates/dst-cli`: `scan` + `migrate`) under the hood.
+  touch, and scaffolds a seed-loop DST test. It drives the **`navian-dst` CLI**
+  (`crates/navian-dst-cli`: `scan` + `migrate`) under the hood.
 
 The barrier to DST has always been the boring, repetitive refactor of threading a
 clock/RNG/network through an existing codebase. That refactor is exactly what an
@@ -36,7 +36,7 @@ agent does perfectly — so the library ships with the thing that installs it.
 ## Quickstart
 
 ```bash
-cargo add dst-rs
+cargo add navian-dst
 ```
 
 A seed-loop test: sweep many seeds, inject crashes on a reproducible timeline, and
@@ -45,7 +45,7 @@ crash*. This is the shape of every DST test (it mirrors the `kv_chaos` example):
 
 ```rust
 use std::collections::HashMap;
-use dst_rs::{Fault, FaultSchedule, Random, SimulatedRandom};
+use navian_dst::{Fault, FaultSchedule, Random, SimulatedRandom};
 
 #[test]
 fn acknowledged_writes_survive_every_crash() {
@@ -138,17 +138,17 @@ If you use Claude Code or Cursor, you don't do the refactor by hand. Install the
 plugin and run one command:
 
 ```text
-/plugin marketplace add /absolute/path/to/dst-rs/plugin
+/plugin marketplace add /absolute/path/to/navian-dst/plugin
 /plugin install dst-init
 /dst-init            # or: /dst-init crates/my-crate
 ```
 
 The agent runs the playbook end to end:
 
-1. **Scan** — `dst scan --json` maps every determinism leak by category (time,
+1. **Scan** — `navian-dst scan --json` maps every determinism leak by category (time,
    random, network, concurrency).
-2. **Migrate** — `dst migrate` applies the seam-safe TIME rewrites: it adds
-   `time: Arc<dyn dst_rs::Time>` to your structs (defaulted to the real clock, so
+2. **Migrate** — `navian-dst migrate` applies the seam-safe TIME rewrites: it adds
+   `time: Arc<dyn navian_dst::Time>` to your structs (defaulted to the real clock, so
    existing callers are unchanged) and routes the leak call sites through it, then
    runs `cargo check` and auto-restores on any failure.
 3. **Scaffold** — a seed-loop DST test for one migrated struct, modeled on the
@@ -164,7 +164,7 @@ deliberately **no MCP server**.
 
 ### Incremental adoption
 
-None of this is all-or-nothing. `dst migrate` defaults every injected field to the
+None of this is all-or-nothing. `navian-dst migrate` defaults every injected field to the
 production impl, so a partially-migrated crate compiles and ships after **every
 single step**. You can migrate one file, review the diff, run your suite, and stop —
 each seam you add is independently useful, and the payoff (replayable failures)
@@ -172,7 +172,7 @@ starts the moment you have one DST test.
 
 ## How it compares
 
-`dst-rs` is **not** the first DST tool for Rust, and doesn't claim to be. The honest
+`navian-dst` is **not** the first DST tool for Rust, and doesn't claim to be. The honest
 positioning:
 
 - **[turmoil](https://github.com/tokio-rs/turmoil)** intercepts tokio's network and
@@ -181,7 +181,7 @@ positioning:
 - **[madsim](https://github.com/madsim-rs/madsim)** is a deterministic async runtime
   that *replaces* tokio wholesale — very powerful, but you adopt its runtime.
 
-`dst-rs` is a **substrate, not a runtime**: you inject four small traits into
+`navian-dst` is a **substrate, not a runtime**: you inject four small traits into
 ordinary code, incrementally, with no runtime swap — and it bundles the whole DST
 loop in one place (replay **+** seeded fault schedules **+** an invariant engine
 **+** `ddmin` shrinking), plus the **AI-native install layer** that does the
@@ -192,8 +192,8 @@ existing crate, installed by an agent — is the differentiation, not "first."
 
 ```
 crates/
-  dst-rs/     # the DST substrate (library) — traits, scheduler, faults, invariants, ddmin
-  dst-cli/    # the `dst` binary — scan (leak detector) + migrate (seam-safe rewriter)
+  navian-dst/     # the DST substrate (library) — traits, scheduler, faults, invariants, ddmin
+  navian-dst-cli/    # the `navian-dst` binary — scan (leak detector) + migrate (seam-safe rewriter)
 plugin/       # Claude Code plugin: /dst-init command, dst skill, dst-migrator subagent
 .cursor/      # the same playbook as a Cursor project rule
 docs/         # launch blog post and design notes
@@ -202,7 +202,7 @@ docs/         # launch blog post and design notes
 ## Testing
 
 ```bash
-cargo test --workspace     # dst-rs (95) + dst-cli (54)
+cargo test --workspace     # navian-dst (95) + navian-dst-cli (54)
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```

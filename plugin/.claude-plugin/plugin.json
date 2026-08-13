@@ -1,7 +1,7 @@
 {
   "name": "dst-init",
   "version": "0.1.0",
-  "description": "Point your coding agent at a Rust crate and make it deterministically testable. Orchestrates the dst-cli scan + migrate tools to find determinism leaks (time/random/network/concurrency), apply seam-safe clock injection, handle the leaks the tool skips, and scaffold a seed-loop DST test — keeping the tree compiling at every step.",
+  "description": "Point your coding agent at a Rust crate and make it deterministically testable. Orchestrates the navian-dst-cli scan + migrate tools to find determinism leaks (time/random/network/concurrency), apply seam-safe clock injection, handle the leaks the tool skips, and scaffold a seed-loop DST test — keeping the tree compiling at every step.",
   "author": {
     "name": "Navian AI"
   },

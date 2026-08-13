@@ -3,7 +3,7 @@
 
 *Repository, crates.io, and generated API-doc links go live at the `v0.1.0` release.*
 
-`dst-rs` is not a new deterministic runtime. It addresses the *adoption* problem
+`navian-dst` is not a new deterministic runtime. It addresses the *adoption* problem
 around deterministic simulation testing (DST): finding ambient nondeterminism in an
 existing service, introducing injectable seams for it, constructing a replayable
 invariant test, and shrinking failures to a minimal reproducer — without an
@@ -57,13 +57,13 @@ tests are experiments, they can only prove the existence of errors, not their
 absence."* ([jepsen.io/ethics](https://jepsen.io/ethics)) That epistemology carries
 through everything below.
 
-## What `dst-rs` actually is
+## What `navian-dst` actually is
 
 The premise of DST: many concurrency failures become reproducible once their hidden
 environmental inputs — time, randomness, scheduling, and I/O outcomes — are made
 explicit and seeded.
 
-`dst-rs` names four sources of nondeterminism as injectable traits, each with a real
+`navian-dst` names four sources of nondeterminism as injectable traits, each with a real
 production impl and a deterministic simulation impl:
 
 - **`Time`** — wall-clock (`now_ms`), monotonic (`instant_now`), and async `sleep`
@@ -92,7 +92,7 @@ On top of those sit the machinery:
 
 Two honest boundaries, stated up front:
 
-- **There is no `Storage` trait.** `dst-rs` schedules crash events reproducibly; your
+- **There is no `Storage` trait.** `navian-dst` schedules crash events reproducibly; your
   application or test supplies the persistence and recovery model. A `CrashRestart` is
   a *modeled event* the harness delivers on the timeline — it invokes your recovery
   path; it does not terminate an OS process or intercept real `write`/`fsync`. The
@@ -151,7 +151,7 @@ of specialized infrastructure teams.
 
 What changed is that the tax is now repetitive, compiler-verifiable refactoring — work
 well suited to a coding agent *when every step is bounded by compilation, tests, and
-human review.* So `dst-rs` ships with the thing that installs it.
+human review.* So `navian-dst` ships with the thing that installs it.
 
 ## The install layer
 
@@ -161,7 +161,7 @@ clock, so existing callers are unaffected:
 
 ```rust
 use std::sync::Arc;
-use dst_rs::Time;
+use navian_dst::Time;
 
 struct RateLimiter {
     tokens: u32,
@@ -171,7 +171,7 @@ struct RateLimiter {
 impl RateLimiter {
     // Existing callers use `new` unchanged — it defaults to the real clock.
     fn new(tokens: u32) -> Self {
-        Self { tokens, time: Arc::new(dst_rs::ProductionTime::default()) }
+        Self { tokens, time: Arc::new(navian_dst::ProductionTime::default()) }
     }
 
     // Tests inject a simulated clock.
@@ -188,7 +188,7 @@ impl RateLimiter {
 
 Callers using `RateLimiter::new(..)` compile unchanged; a *direct* struct literal like
 `RateLimiter { tokens }` must be updated. That is precisely the mechanical part the
-tooling handles. The `dst` CLI has two subcommands: `scan` finds the ambient
+tooling handles. The `navian-dst` CLI has two subcommands: `scan` finds the ambient
 nondeterminism, and `migrate` performs the seam-safe rewrites — it adds the field,
 defaults it to production in every constructor and struct literal it can see, rewrites
 the leak sites, and runs `cargo check`. Anything it cannot rewrite safely — free
@@ -208,7 +208,7 @@ The broader idea, beyond this one library: in the agent era an SDK can ship more
 a README a human executes. It can ship a capability an agent executes, in four parts —
 *describe* the tool (a skill file), *teach* the conventions and invariants (a
 reference doc), *do* the mechanical work (the CLI and migration playbook), and
-*verify* the result (`cargo check` + `cargo test` + a `SEED=` replay hint). `dst-rs`
+*verify* the result (`cargo check` + `cargo test` + a `SEED=` replay hint). `navian-dst`
 ships exactly this as a Claude Code plugin and a Cursor rule: run `/dst-init`, and the
 agent drives `scan`, runs `migrate`, hand-finishes what `migrate` skips, and scaffolds
 a seed-loop test — keeping the crate compiling after every step, one file at a time.
@@ -239,7 +239,7 @@ don't swap your runtime. Simulated impls appear only in tests.
 **What does adoption look like?**
 
 ```text
-$ dst scan src/
+$ navian-dst scan src/
 == Determinism leaks ==
 
 TIME (5)
@@ -249,7 +249,7 @@ RANDOM (3)
   src/token.rs:14     [RANDOM]   Uuid::new_v4()      (in fn `issue`)
 NETWORK (2) · CONCURRENCY (1)
 
-11 leaks across 4 files — run `dst migrate` (or `/dst-init`) to wire the seams
+11 leaks across 4 files — run `navian-dst migrate` (or `/dst-init`) to wire the seams
 ```
 
 **How does it fit CI?** A seed sweep is cheap — `kv_chaos` typically completes 500
@@ -262,7 +262,7 @@ event engine, with the replay / fault / shrink loop covered by its own test suit
 
 ## How it compares
 
-`dst-rs` is not the first or the broadest DST tool for Rust, and the field is strong:
+`navian-dst` is not the first or the broadest DST tool for Rust, and the field is strong:
 
 - **[turmoil](https://github.com/tokio-rs/turmoil)** — runs multiple simulated hosts
   on one thread and provides deterministic network and filesystem implementations,
@@ -279,12 +279,12 @@ event engine, with the replay / fault / shrink loop covered by its own test suit
   documented incompleteness).
 
 These control different surfaces, and the complementary tools — proptest/quickcheck
-(inputs), kani (bounded proof), miri (UB) — sit on other axes again. `dst-rs` makes
+(inputs), kani (bounded proof), miri (UB) — sit on other axes again. `navian-dst` makes
 one specific bet: a *substrate, not a runtime* — inject four traits incrementally into
 ordinary code, no runtime swap — bundling replay + seeded faults + an invariant engine
 + shrinking, plus an agent-driven install. If you want the broadest coverage on day
 one with a runtime swap, use madsim; turmoil is the mature choice for host / network /
-filesystem simulation of a distributed protocol. `dst-rs` trades some of that coverage
+filesystem simulation of a distributed protocol. `navian-dst` trades some of that coverage
 for incremental adoption you can start in one file.
 
 The honest cost of "substrate, not runtime" is coverage: only code routed through the
@@ -292,13 +292,13 @@ seams is visible to the simulator. And no simulator reaches *total* determinism 
 madsim, for instance, ships a determinism self-check that re-runs a test under the
 same seed and fails on divergence, precisely because escapes exist: `HashMap`
 iteration order, real `Instant`/`SystemTime`, ASLR, floating-point reordering, native
-threads, and any I/O that bypasses the shims. `dst-rs` inherits the same caveats and
+threads, and any I/O that bypasses the shims. `navian-dst` inherits the same caveats and
 points you at single-threaded `SimScheduler` drive to hold determinism; treat
 everything outside the seams as untested, not as verified.
 
 ## Why we built it, and why we're opening it
 
-We built `dst-rs` for our own use. At Navian AI we build a real-time
+We built `navian-dst` for our own use. At Navian AI we build a real-time
 event-processing engine for financial services, where a wrong answer under a rare
 failure can become a customer-impacting and potentially reportable incident. It has to
 stay correct when a node dies mid-write, when the network splits, when events arrive
@@ -309,11 +309,11 @@ controls.
 
 None of that substrate is our moat — the moat is the detection engine on top, not the
 harness that tests it. It's domain-agnostic infrastructure most teams can't justify
-building from scratch, and `dst-rs` is the first piece we're extracting. On the
+building from scratch, and `navian-dst` is the first piece we're extracting. On the
 near-term list, in descending readiness: **streaming drift detectors** (CUSUM and
 ADWIN — textbook, deterministic, already written to be domain-agnostic), a
 **distribution-free conformal anomaly primitive** (calibrated, per-entity p-values),
-and the **chaos / reproduction-shrinking harness** that is `dst-rs`'s sibling. Further
+and the **chaos / reproduction-shrinking harness** that is `navian-dst`'s sibling. Further
 out — today a design spec rather than code — is **PulseBench**, a neutral benchmark for
 structured-entity memory. We'll ship what's ready and clearly label what isn't. We're
 opening it to give back
@@ -324,6 +324,6 @@ that's the point — tell us.
 
 ---
 
-*`dst-rs` is `v0.1`, Apache-2.0. `cargo add dst-rs`, run the examples, and try
+*`navian-dst` is `v0.1`, Apache-2.0. `cargo add navian-dst`, run the examples, and try
 `/dst-init` on a crate you own. It will find counterexamples or tell you a seed
 campaign passed — it won't promise more than that, and neither will we.*
