@@ -214,7 +214,7 @@ Found a bug, or have a question?
 - **Bugs** — open an [issue](https://github.com/TheFuturePlutus/navian-dst/issues). DST failures are seed-deterministic, so including the failing `SEED=<n>` and a minimal test lets us replay it exactly.
 - **Questions, ideas, show-and-tell** — start a [discussion](https://github.com/TheFuturePlutus/navian-dst/discussions).
 
-Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md). Where this is headed: [ROADMAP.md](./ROADMAP.md).
 
 ## License
 
