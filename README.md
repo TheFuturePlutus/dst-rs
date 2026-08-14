@@ -207,6 +207,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+## Feedback & support
+
+Found a bug, or have a question?
+
+- **Bugs** — open an [issue](https://github.com/TheFuturePlutus/navian-dst/issues). DST failures are seed-deterministic, so including the failing `SEED=<n>` and a minimal test lets us replay it exactly.
+- **Questions, ideas, show-and-tell** — start a [discussion](https://github.com/TheFuturePlutus/navian-dst/discussions).
+
+Contributions are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](./LICENSE).
