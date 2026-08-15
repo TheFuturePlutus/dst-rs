@@ -17,7 +17,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use migrate::{migrate_path, CheckOutcome, MigrateOptions, MigrateResult, TraitFamily};
-use scanner::{scan_path, Category, ScanReport};
+use scanner::{rule_by_id, scan_path, Category, Confidence, ScanReport};
+
+/// Exit code for a tool/usage error (bad args, unreadable path).
+const EXIT_USAGE: u8 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -52,10 +55,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Exit non-zero if any leak is found (time/random/network/concurrency)
-        /// — turns `scan` into a CI gate.
+        /// Turn `scan` into a CI gate: exit non-zero if any finding is at or
+        /// above the deny threshold. Fails on `high`-confidence findings by
+        /// default; lower the bar with `--deny-level`.
         #[arg(long)]
         deny: bool,
+
+        /// Confidence threshold the `--deny` gate fails on: `high` (default),
+        /// `medium`, or `advisory` (fail on anything). Implies `--deny`.
+        #[arg(long, value_name = "high|medium|advisory")]
+        deny_level: Option<String>,
     },
 
     /// Rewrite a conservative, seam-safe subset of determinism leaks so the
@@ -92,19 +101,59 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Scan { path, json, deny } => {
+        Commands::Scan {
+            path,
+            json,
+            deny,
+            deny_level,
+        } => {
+            // Resolve the deny threshold. `--deny-level` implies `--deny` and
+            // sets the bar; bare `--deny` fails on `high` only.
+            let threshold = match deny_level.as_deref() {
+                Some(s) => match Confidence::parse(s) {
+                    Some(c) => Some(c),
+                    None => {
+                        eprintln!(
+                            "error: invalid --deny-level `{s}` (expected high|medium|advisory)"
+                        );
+                        return ExitCode::from(EXIT_USAGE);
+                    }
+                },
+                None => deny.then_some(Confidence::High),
+            };
+
+            // A path that does not exist is a usage error (exit 2), not a
+            // "clean" scan — never let a typo look like a passing gate.
+            if !path.exists() {
+                eprintln!("error: path does not exist: {}", path.display());
+                return ExitCode::from(EXIT_USAGE);
+            }
+
             let report = scan_path(&path);
             if json {
                 emit_json(&report);
             } else {
-                emit_human(&report);
+                emit_human(&report, threshold);
             }
-            // Every category is a hard, gate-failing leak — the scanner errs
-            // toward flagging, so `--deny` fails whenever anything is found.
-            if deny && !report.leaks.is_empty() {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+
+            // Exit-code contract:
+            //   0 — clean, or findings present without a deny gate;
+            //   1 — one or more findings at/above the deny threshold under a gate;
+            //   2 — tool/usage error, OR (under a gate) files that could not be
+            //       read/parsed: the gate cannot certify a tree it never saw.
+            match threshold {
+                Some(_) if report.uncertifiable() => {
+                    eprintln!(
+                        "error: cannot certify — {} file(s) could not be read or parsed:",
+                        report.parse_failures.len()
+                    );
+                    for f in &report.parse_failures {
+                        eprintln!("  {f}");
+                    }
+                    ExitCode::from(EXIT_USAGE)
+                }
+                Some(t) if report.any_at_or_above(t) => ExitCode::FAILURE,
+                _ => ExitCode::SUCCESS,
             }
         }
         Commands::Migrate {
@@ -237,22 +286,16 @@ fn emit_migrate(result: &MigrateResult, dry_run: bool) -> ExitCode {
 }
 
 fn emit_json(report: &ScanReport) {
-    // The `--json` contract is exactly the leak array: [{file,line,col,category,snippet,fn}].
+    // The `--json` contract is exactly the leak array. Each item is a stable
+    // object: {rule_id, confidence, category, file, line, col, function, snippet}.
     match serde_json::to_string_pretty(&report.leaks) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("failed to serialize leaks: {e}"),
     }
 }
 
-fn emit_human(report: &ScanReport) {
+fn emit_human(report: &ScanReport, threshold: Option<Confidence>) {
     use std::collections::BTreeSet;
-
-    let categories = [
-        Category::Time,
-        Category::Random,
-        Category::Network,
-        Category::Concurrency,
-    ];
 
     println!("== Determinism leaks ==\n");
 
@@ -260,7 +303,7 @@ fn emit_human(report: &ScanReport) {
         println!("No determinism leaks found.\n");
     }
 
-    for cat in categories {
+    for &cat in Category::all() {
         let hits: Vec<_> = report.leaks.iter().filter(|l| l.category == cat).collect();
         if hits.is_empty() {
             continue;
@@ -268,12 +311,14 @@ fn emit_human(report: &ScanReport) {
         println!("{} ({})", cat.label(), hits.len());
         for leak in hits {
             let loc = format!("{}:{}", leak.file, leak.line);
-            let in_fn = match &leak.func {
+            let in_fn = match &leak.function {
                 Some(name) => format!("   (in fn `{name}`)"),
                 None => String::new(),
             };
             println!(
-                "  {loc}  [{}]  {}{in_fn}",
+                "  {loc}  [{} {}]  {}  {}{in_fn}",
+                leak.confidence.label(),
+                leak.rule_id,
                 leak.category.label(),
                 leak.snippet
             );
@@ -281,8 +326,21 @@ fn emit_human(report: &ScanReport) {
         println!();
     }
 
-    // Per-category tallies for the summary line.
-    let count = |c: Category| report.leaks.iter().filter(|l| l.category == c).count();
+    // Rule legend: describe every rule that fired, from the catalog.
+    if !report.leaks.is_empty() {
+        let ids: BTreeSet<&str> = report.leaks.iter().map(|l| l.rule_id).collect();
+        println!("Rules:");
+        for id in ids {
+            match rule_by_id(id) {
+                Some(rule) => println!("  {id}  {}", rule.description),
+                None => println!("  {id}"),
+            }
+        }
+        println!();
+    }
+
+    // Confidence-tier tallies.
+    let by_conf = |c: Confidence| report.leaks.iter().filter(|l| l.confidence == c).count();
     let files: BTreeSet<&str> = report.leaks.iter().map(|l| l.file.as_str()).collect();
 
     println!(
@@ -297,13 +355,19 @@ fn emit_human(report: &ScanReport) {
         }
     }
     println!(
-        "{} leak(s) across {} file(s) \
-         ({} time, {} random, {} network, {} concurrency).",
+        "{} leak(s) across {} file(s) ({} high, {} medium, {} advisory).",
         report.leaks.len(),
         files.len(),
-        count(Category::Time),
-        count(Category::Random),
-        count(Category::Network),
-        count(Category::Concurrency),
+        by_conf(Confidence::High),
+        by_conf(Confidence::Medium),
+        by_conf(Confidence::Advisory),
     );
+    match threshold {
+        Some(t) if report.any_at_or_above(t) => println!(
+            "GATE: FAIL — findings at or above `{}` (--deny threshold).",
+            t.label()
+        ),
+        Some(t) => println!("GATE: pass — no findings at or above `{}`.", t.label()),
+        None => {}
+    }
 }

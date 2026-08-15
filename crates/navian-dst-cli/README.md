@@ -13,16 +13,61 @@ so the crate becomes replayable under a simulated clock.
 
 ## `navian-dst scan` — find determinism leaks
 
-A static (syn-based) detector for calls into wall-clock time, RNG, network, and
-unstructured-concurrency APIs — the things that break replay-based testing.
+A static (syn-based) detector for calls into wall-clock time, RNG, network,
+unstructured concurrency, environment/process reads, filesystem enumeration,
+hash-container iteration order, and relaxed atomics — the things that break
+replay-based testing.
 
 ```bash
-navian-dst scan                 # human report for the current directory
-navian-dst scan --json ./src    # machine-readable: [{file,line,col,category,snippet,fn}]
-navian-dst scan --deny          # exit non-zero if any leak is found (CI gate)
+navian-dst scan                     # human report for the current directory
+navian-dst scan --json ./src        # machine-readable JSON (schema below)
+navian-dst scan --deny              # CI gate: fail on HIGH-confidence findings
+navian-dst scan --deny-level medium # lower the gate to also fail on MEDIUM
 ```
 
-Categories: `time`, `random`, `network`, `concurrency`.
+Categories: `time`, `random`, `network`, `concurrency`, `iteration`, `env`,
+`filesystem`, `atomic`.
+
+### Confidence tiers
+
+It is a **name-based heuristic**, not a sound analyzer, so every finding carries
+a confidence tier and a stable rule id (e.g. `DST-TIME-001`):
+
+- **high** — well-known std/ecosystem sources unlikely to be shadowed
+  (`SystemTime::now`, `Instant::now`, `thread_rng`, `OsRng`, `getrandom`,
+  `TcpStream::connect`, `thread::spawn`). **The CI gate fails on these.**
+- **medium** — recognizable but more shadowable (`chrono::Utc::now`,
+  `uuid::Uuid::new_v4`, `std::env::var`, `read_dir`).
+- **advisory** — fuzzy / often-intentional (`.gen()`, `HashMap`/`HashSet`
+  iteration order, `Ordering::Relaxed`, `tokio::spawn`, rayon `par_iter`).
+
+`--deny` fails on **high** by default; `--deny-level {high|medium|advisory}`
+lowers the threshold (`advisory` = fail on anything). Keeping the gate on high
+only is what lets `scan` surface fuzzy sources without a wall of gate-failing
+false positives.
+
+### Exit codes
+
+- `0` — clean, or findings present without a `--deny` gate.
+- `1` — one or more findings at or above the `--deny` threshold under a gate.
+- `2` — tool/usage error (bad arguments, unreadable/nonexistent path).
+
+### JSON schema
+
+`--json` prints an array of items, each a stable object:
+
+```json
+{
+  "rule_id":    "DST-TIME-001",
+  "confidence": "high",
+  "category":   "time",
+  "file":       "src/lib.rs",
+  "line":       12,
+  "col":        5,
+  "function":   "stamp",
+  "snippet":    "SystemTime::now()"
+}
+```
 
 ## `navian-dst migrate` — seam-safe time rewrites
 
