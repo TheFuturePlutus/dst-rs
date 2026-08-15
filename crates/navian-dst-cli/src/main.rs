@@ -979,6 +979,10 @@ fn emit_human(report: &ScanReport, threshold: Option<Confidence>) {
         by_conf(Confidence::Advisory),
     );
     match threshold {
+        Some(_) if report.uncertifiable() => println!(
+            "GATE: cannot certify — {} file(s) could not be read or parsed.",
+            report.parse_failures.len()
+        ),
         Some(t) if report.any_at_or_above(t) => println!(
             "GATE: FAIL — findings at or above `{}` (--deny threshold).",
             t.label()

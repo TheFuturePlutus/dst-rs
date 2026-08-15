@@ -1,10 +1,10 @@
 [package]
 name = "navian-dst-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
 license = "Apache-2.0"
-description = "Command-line tools for the navian-dst deterministic-simulation-testing substrate: a determinism-leak scanner and a seam-safe time-migration rewriter."
+description = "CLI for navian-dst deterministic simulation testing: a tiered, CI-ready determinism-leak scanner (SARIF/baseline), a seam-safe time-migration codemod, per-rule fix recipes, and a run-twice determinism check."
 repository = "https://github.com/TheFuturePlutus/navian-dst"
 homepage = "https://github.com/TheFuturePlutus/navian-dst"
 readme = "README.md"
