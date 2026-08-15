@@ -31,6 +31,20 @@
 //! type-check, the caller (`main`) restores the original bytes from an
 //! in-memory snapshot and reports the failure — the tree is never left broken.
 //!
+//! ## Known gate gap: doctests
+//!
+//! The apply-time safety gate is `cargo check --all-targets`, which covers the
+//! lib, bins, integration tests, examples, and benches. It does NOT cover
+//! **doctests**: cargo can only verify a doctest by *running* it (`cargo test
+//! --doc`; `--no-run` is rejected), so `--all-targets` structurally excludes
+//! them. A migrated struct constructed via a struct literal *inside* a
+//! doc-comment example would therefore break `cargo test --doc` while the gate
+//! stays green — and migrate cannot rewrite that literal, since it lives in a
+//! doc-string, not the parsed AST. Mitigations: `--check-doctests` adds
+//! `cargo test --doc` as a second gate (opt-in — it runs user code and is slow),
+//! and when it is off migrate prints a warning after migrating any struct, so the
+//! gap is never silent.
+//!
 //! ## Offsets
 //!
 //! All edits are computed as byte ranges via [`proc_macro2::Span::byte_range`]
@@ -58,6 +72,14 @@ pub enum TraitFamily {
 pub struct MigrateOptions {
     pub dry_run: bool,
     pub traits: Vec<TraitFamily>,
+    /// After the `cargo check --all-targets` gate passes, ALSO run
+    /// `cargo test --doc` and roll the whole run back if any doctest fails.
+    ///
+    /// OFF by default: doctests can only be verified by *running* them (cargo
+    /// rejects `--no-run` for `--doc`), which executes user code and is slow — so
+    /// gating on them is opt-in. When off, a warning is emitted instead (see the
+    /// module docs' "Known gate gap").
+    pub check_doctests: bool,
 }
 
 /// A single leak that was deliberately NOT rewritten, with a human reason.
@@ -85,7 +107,8 @@ pub enum CheckOutcome {
     /// Not run (dry-run, or no files changed).
     Skipped,
     Passed,
-    /// `cargo check` failed; files were restored. Carries captured stderr.
+    /// `cargo check --all-targets` failed (some target — lib/bin/test/example/
+    /// bench — no longer compiles); files were restored. Carries captured stderr.
     Failed(String),
 }
 
@@ -106,6 +129,10 @@ pub struct MigrateResult {
     /// True if the migrator determined the tree was already migrated / had
     /// nothing rewritable (idempotent no-op).
     pub no_op: bool,
+    /// Whether the applied run additionally gated on `cargo test --doc`
+    /// (`--check-doctests`). When false and a struct was migrated, the caller
+    /// emits the doctest-gap warning.
+    pub doctests_checked: bool,
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -136,8 +163,10 @@ pub fn migrate_path(root: &Path, opts: &MigrateOptions) -> MigrateResult {
     result.check = if opts.dry_run || result.changes.is_empty() {
         CheckOutcome::Skipped
     } else {
-        apply_and_check(root, &result.changes)
+        apply_and_check(root, &result.changes, opts.check_doctests)
     };
+    // Only meaningful once something was actually applied; harmless otherwise.
+    result.doctests_checked = opts.check_doctests && matches!(result.check, CheckOutcome::Passed);
 
     result
 }
@@ -184,6 +213,7 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
         rewrites: Vec<Rewrite>,
         literals: Vec<StructLiteral>,
         skips: Vec<Skip>,
+        inherent_impls: Vec<InherentImpl>,
     }
     let mut plans: Vec<FilePlan> = Vec::new();
     for (idx, p) in parsed.iter().enumerate() {
@@ -200,6 +230,7 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
             rewrites: Vec::new(),
             literals: Vec::new(),
             skips: Vec::new(),
+            inherent_impls: Vec::new(),
         };
         t.visit_file(&p.ast);
         plans.push(FilePlan {
@@ -207,6 +238,7 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
             rewrites: t.rewrites,
             literals: t.literals,
             skips: t.skips,
+            inherent_impls: t.inherent_impls,
         });
     }
 
@@ -219,12 +251,39 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
         }
     }
 
+    // ── Choose where to place each migrated struct's public `with_time` builder. ──
+    // A struct that already defines a `with_time` method (anywhere in scope) is
+    // skipped (idempotency). Otherwise the builder is placed in the inherent impl
+    // block that CONTAINS the (first) rewrite for that struct — so its `Self`
+    // matches the impl where `self.time` is used, covering the general `impl<T>`
+    // for a generic struct rather than a specialized one.
+    let mut has_with_time: BTreeSet<String> = BTreeSet::new();
+    for plan in &plans {
+        for imp in &plan.inherent_impls {
+            if imp.has_with_time {
+                has_with_time.insert(imp.struct_name.clone());
+            }
+        }
+    }
+    // struct name -> (plan index, byte offset just past the containing impl's `{`).
+    let mut with_time_target: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for (pi, plan) in plans.iter().enumerate() {
+        for r in &plan.rewrites {
+            if has_with_time.contains(&r.struct_name) {
+                continue;
+            }
+            with_time_target
+                .entry(r.struct_name.clone())
+                .or_insert((pi, r.impl_brace_open_end));
+        }
+    }
+
     // ── Pass 3: turn the plan into concrete byte edits per file & apply. ──
     let mut changes: Vec<FileChange> = Vec::new();
     let mut leaks_rewritten = 0usize;
     let mut all_skips: Vec<Skip> = Vec::new();
 
-    for plan in &plans {
+    for (pi, plan) in plans.iter().enumerate() {
         let p = &parsed[plan.idx];
         let mut edits: Vec<Edit> = Vec::new();
 
@@ -292,13 +351,34 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
             });
         }
 
+        // (d) Add a PUBLIC `with_time` consuming builder to one inherent impl of
+        //     each migrated struct whose builder target lives in THIS file, so
+        //     downstream/integration code can inject a fake clock (the field is
+        //     private). Placed once per struct; skipped if one already exists.
+        for (target_pi, offset) in with_time_target.values() {
+            if *target_pi == pi {
+                edits.push(Edit {
+                    start: *offset,
+                    end: *offset,
+                    text: WITH_TIME_METHOD.to_string(),
+                });
+            }
+        }
+
         // Skips are reported regardless of whether the file changed.
         all_skips.extend(plan.skips.iter().cloned());
 
         if edits.is_empty() {
             continue;
         }
-        let modified = apply_edits(&p.source, edits);
+        let mut modified = apply_edits(&p.source, edits);
+        // After rewriting time leaks, an imported time name (`SystemTime` /
+        // `UNIX_EPOCH` / `Instant`) may no longer appear anywhere in the file.
+        // Remove such now-dead imports (conservatively — only when the name is
+        // truly unused in the rewritten text).
+        if !plan.rewrites.is_empty() {
+            modified = prune_unused_time_imports(&modified);
+        }
         let diff = unified_diff(&p.display, &p.source, &modified);
         changes.push(FileChange {
             path: p.path.clone(),
@@ -318,17 +398,37 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
         parse_failures,
         check: CheckOutcome::Skipped,
         no_op,
+        doctests_checked: false,
     }
 }
 
 const FIELD_DECL: &str = "time: std::sync::Arc<dyn navian_dst::Time>";
 const FIELD_DEFAULT: &str = "time: std::sync::Arc::new(navian_dst::ProductionTime::default())";
 
+/// The public consuming builder injected into one inherent impl of every
+/// migrated struct, so downstream/integration code can swap in a fake clock
+/// (the `time` field itself is private). Leading newline lands it just after the
+/// impl's opening `{`.
+const WITH_TIME_METHOD: &str = "\n    /// Inject a clock for deterministic tests (defaults to the production clock).\n    pub fn with_time(mut self, time: std::sync::Arc<dyn navian_dst::Time>) -> Self {\n        self.time = time;\n        self\n    }\n";
+
 // ── Write / cargo-check / restore ───────────────────────────────────────────
 
-/// Write every change, run `cargo check` on the owning crate, and restore the
-/// originals from the in-memory snapshot if the check fails.
-fn apply_and_check(root: &Path, changes: &[FileChange]) -> CheckOutcome {
+/// Write every change, run `cargo check --all-targets` on the owning crate, and
+/// restore the originals from the in-memory snapshot if the check fails (for ANY
+/// target — lib, bins, tests, examples, benches).
+///
+/// ## Known gate gap: doctests
+///
+/// `cargo check --all-targets` does NOT cover doctests — cargo can only verify a
+/// doctest by *running* it (`cargo test --doc`; `--no-run` is rejected). So a
+/// migrated struct constructed via a struct literal INSIDE a doc-comment example
+/// (e.g. ```` ``` let f = Foo { id: 1 }; ``` ````) would break `cargo test --doc`
+/// while this gate stays green. migrate cannot rewrite that literal either — it
+/// lives in a doc-string, not the AST. Two mitigations: pass `check_doctests` to
+/// additionally gate on `cargo test --doc` (opt-in, because it runs user code and
+/// is slow), and — when it is off — the caller prints a warning so the gap is
+/// never silent.
+fn apply_and_check(root: &Path, changes: &[FileChange], check_doctests: bool) -> CheckOutcome {
     // Write modified bytes.
     for c in changes {
         if let Err(e) = std::fs::write(&c.path, &c.modified) {
@@ -341,9 +441,17 @@ fn apply_and_check(root: &Path, changes: &[FileChange]) -> CheckOutcome {
     let manifest =
         find_manifest(root).or_else(|| changes.first().and_then(|c| find_manifest(&c.path)));
 
+    // `--all-targets` is LOAD-BEARING, not cosmetic. A plain `cargo check` builds
+    // only the default (lib/bin) targets, so it would MISS a break the migration
+    // caused in an integration test, example, or bench — e.g. a public struct
+    // built via a struct literal in `tests/*.rs`: adding the private `time` field
+    // makes that external literal fail with `error[E0451]: field time is private`,
+    // yet a lib-only check passes. Checking every target closes that gap; any
+    // target failing to compile trips the exact-byte rollback below, so migrate
+    // never leaves a tree where `cargo check --all-targets` fails.
     let output = {
         let mut cmd = std::process::Command::new("cargo");
-        cmd.arg("check");
+        cmd.arg("check").arg("--all-targets");
         if let Some(m) = &manifest {
             cmd.arg("--manifest-path").arg(m);
         }
@@ -351,7 +459,17 @@ fn apply_and_check(root: &Path, changes: &[FileChange]) -> CheckOutcome {
     };
 
     match output {
-        Ok(out) if out.status.success() => CheckOutcome::Passed,
+        Ok(out) if out.status.success() => {
+            // Optional second gate: doctests. `--all-targets` structurally
+            // excludes them (they can only be verified by running), so a struct
+            // built via a literal inside a doc example breaks `cargo test --doc`
+            // while the check above stays green. Opt-in because it runs user code.
+            if check_doctests {
+                run_doctests_gate(&manifest, changes)
+            } else {
+                CheckOutcome::Passed
+            }
+        }
         Ok(out) => {
             restore(changes);
             CheckOutcome::Failed(String::from_utf8_lossy(&out.stderr).into_owned())
@@ -359,6 +477,34 @@ fn apply_and_check(root: &Path, changes: &[FileChange]) -> CheckOutcome {
         Err(e) => {
             restore(changes);
             CheckOutcome::Failed(format!("could not run `cargo check`: {e}"))
+        }
+    }
+}
+
+/// Run `cargo test --doc` (honoring the caller's env) and, on any doctest
+/// compile/run failure, restore the originals — same all-or-nothing rollback as
+/// the `--all-targets` gate. Called only after that gate has already passed.
+fn run_doctests_gate(manifest: &Option<PathBuf>, changes: &[FileChange]) -> CheckOutcome {
+    let output = {
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.arg("test").arg("--doc");
+        if let Some(m) = manifest {
+            cmd.arg("--manifest-path").arg(m);
+        }
+        cmd.output()
+    };
+    match output {
+        Ok(out) if out.status.success() => CheckOutcome::Passed,
+        Ok(out) => {
+            restore(changes);
+            // Doctest failures surface on stdout (the harness) as well as stderr.
+            let mut msg = String::from_utf8_lossy(&out.stdout).into_owned();
+            msg.push_str(&String::from_utf8_lossy(&out.stderr));
+            CheckOutcome::Failed(msg)
+        }
+        Err(e) => {
+            restore(changes);
+            CheckOutcome::Failed(format!("could not run `cargo test --doc`: {e}"))
         }
     }
 }
@@ -643,6 +789,12 @@ struct Rewrite {
     start: usize,
     end: usize,
     replacement: String,
+    /// Byte offset just past the opening `{` of the inherent impl block that
+    /// CONTAINS this rewrite — where the struct's public `with_time` builder is
+    /// placed, so its `Self` matches the impl where `self.time` is used (and, for
+    /// a generic struct, covers the general `impl<T>` rather than a specialized
+    /// one).
+    impl_brace_open_end: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -662,6 +814,16 @@ struct StructLiteral {
     has_rest: bool,
 }
 
+/// An inherent `impl Foo { … }` block (never a trait impl). Used to detect an
+/// existing `with_time` method (idempotency) on a migrated struct.
+#[derive(Debug, Clone)]
+struct InherentImpl {
+    struct_name: String,
+    /// This impl already defines a `with_time` method (idempotency): don't add a
+    /// second one to the struct.
+    has_with_time: bool,
+}
+
 /// What kind of enclosing function a leak sits in.
 #[derive(Debug, Clone)]
 enum FnCtx {
@@ -678,6 +840,8 @@ enum FnCtx {
 struct ImplCtx {
     self_ty: Option<String>,
     is_trait: bool,
+    /// Byte offset just past this impl block's opening `{`.
+    brace_open_end: usize,
 }
 
 struct TransformVisitor<'a> {
@@ -702,6 +866,9 @@ struct TransformVisitor<'a> {
     rewrites: Vec<Rewrite>,
     literals: Vec<StructLiteral>,
     skips: Vec<Skip>,
+    /// Every inherent `impl` block in the file, for placing the `with_time`
+    /// builder on migrated structs.
+    inherent_impls: Vec<InherentImpl>,
 }
 
 /// 1-based line, 1-based col from a byte offset into `source`.
@@ -758,6 +925,17 @@ impl TransformVisitor<'_> {
 
     fn is_consumed(&self, start: usize, end: usize) -> bool {
         self.consumed.iter().any(|(s, e)| start >= *s && end <= *e)
+    }
+
+    /// Byte offset just past the opening `{` of the innermost enclosing impl —
+    /// the block that contains the leak being rewritten. A rewrite is only ever
+    /// recorded inside an inherent `&self` method, so this is always the impl
+    /// where `self.time` is used and where the `with_time` builder belongs.
+    fn cur_impl_brace_open_end(&self) -> usize {
+        self.impl_stack
+            .last()
+            .map(|c| c.brace_open_end)
+            .unwrap_or(0)
     }
 
     fn is_cast_guarded(&self, start: usize, end: usize) -> bool {
@@ -931,9 +1109,24 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
             syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
             _ => None,
         };
+        let brace_open_end = node.brace_token.span.open().byte_range().end;
+        // Record inherent (non-trait) impl blocks so we can detect an existing
+        // `with_time` method on a migrated struct (idempotency).
+        if node.trait_.is_none() {
+            if let Some(name) = &self_ty {
+                let has_with_time = node.items.iter().any(|it| {
+                    matches!(it, syn::ImplItem::Fn(f) if f.sig.ident == "with_time")
+                });
+                self.inherent_impls.push(InherentImpl {
+                    struct_name: name.clone(),
+                    has_with_time,
+                });
+            }
+        }
         self.impl_stack.push(ImplCtx {
             self_ty,
             is_trait: node.trait_.is_some(),
+            brace_open_end,
         });
         visit::visit_item_impl(self, node);
         self.impl_stack.pop();
@@ -951,6 +1144,7 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
             Some(ImplCtx {
                 self_ty: Some(name),
                 is_trait: false,
+                ..
             }) => FnCtx::Inherent {
                 struct_name: name.clone(),
                 has_self,
@@ -1049,11 +1243,13 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
                     };
                     self.push_skip(whole.start, whole.end, reason);
                 } else if let Some(target) = self.resolve_rewrite_target(whole.start, whole.end) {
+                    let impl_brace_open_end = self.cur_impl_brace_open_end();
                     self.rewrites.push(Rewrite {
                         struct_name: target,
                         start: whole.start,
                         end: whole.end,
                         replacement: "self.time.now_ms()".to_string(),
+                        impl_brace_open_end,
                     });
                 }
             }
@@ -1075,11 +1271,13 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
             if prev == "Instant" && last == "now" {
                 if let Some(target) = self.resolve_rewrite_target(whole_span.start, whole_span.end)
                 {
+                    let impl_brace_open_end = self.cur_impl_brace_open_end();
                     self.rewrites.push(Rewrite {
                         struct_name: target,
                         start: func_span.start,
                         end: func_span.end,
                         replacement: "self.time.instant_now".to_string(),
+                        impl_brace_open_end,
                     });
                 }
             }
@@ -1087,11 +1285,13 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
             else if prev == "time" && last == "sleep" {
                 if let Some(target) = self.resolve_rewrite_target(whole_span.start, whole_span.end)
                 {
+                    let impl_brace_open_end = self.cur_impl_brace_open_end();
                     self.rewrites.push(Rewrite {
                         struct_name: target,
                         start: func_span.start,
                         end: func_span.end,
                         replacement: "self.time.sleep".to_string(),
+                        impl_brace_open_end,
                     });
                 }
             }
@@ -1160,6 +1360,167 @@ fn apply_edits(source: &str, mut edits: Vec<Edit>) -> String {
         last_start = e.start;
     }
     out
+}
+
+/// Remove now-dead `use` imports of the time names our rewrites eliminate
+/// (`SystemTime` / `UNIX_EPOCH` / `Instant`) from already-rewritten `src`.
+///
+/// CONSERVATIVE by construction:
+///   * A name is removed only when it no longer occurs as a whole word ANYWHERE
+///     in the rewritten text outside a `use` statement (return types, other
+///     methods, free functions, macros — all counted, so anything still using it
+///     keeps the import).
+///   * Only the three names above are candidates; every other import (e.g.
+///     `Duration`) is left alone.
+///   * Renamed / glob / nested use-trees are left untouched — only a terminal
+///     plain `Name` or an all-plain-`Name` group is edited.
+///
+/// Returns `src` unchanged if it does not parse or nothing is removable.
+fn prune_unused_time_imports(src: &str) -> String {
+    const CANDIDATES: &[&str] = &["SystemTime", "UNIX_EPOCH", "Instant"];
+
+    let Ok(ast) = syn::parse_file(src) else {
+        return src.to_string();
+    };
+
+    // Collect every `use` item; clones retain their source spans.
+    struct UseCollector {
+        items: Vec<syn::ItemUse>,
+    }
+    impl<'ast> Visit<'ast> for UseCollector {
+        fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+            self.items.push(node.clone());
+            // No nested use items to descend into.
+        }
+    }
+    let mut uc = UseCollector { items: Vec::new() };
+    uc.visit_file(&ast);
+    if uc.items.is_empty() {
+        return src.to_string();
+    }
+
+    let use_ranges: Vec<(usize, usize)> = uc
+        .items
+        .iter()
+        .map(|u| {
+            let r = u.span().byte_range();
+            (r.start, r.end)
+        })
+        .collect();
+
+    let bytes = src.as_bytes();
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    // Whether `name` occurs as a whole word anywhere EXCEPT inside the `use` item
+    // at `cur` (its own import). A mention in ANY other `use` counts as still-used
+    // (conservative: we never strip a name a sibling import still needs).
+    let used_elsewhere = |name: &str, cur: (usize, usize)| -> bool {
+        let mut i = 0usize;
+        while let Some(off) = src[i..].find(name) {
+            let start = i + off;
+            let end = start + name.len();
+            let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+            let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+            let is_own_import = start >= cur.0 && end <= cur.1;
+            if before_ok && after_ok && !is_own_import {
+                return true;
+            }
+            i = start + 1;
+        }
+        false
+    };
+    let should_remove =
+        |name: &str, cur: (usize, usize)| CANDIDATES.contains(&name) && !used_elsewhere(name, cur);
+
+    // Terminal use-tree, following the leading `a::b::` path segments.
+    fn terminal(tree: &syn::UseTree) -> &syn::UseTree {
+        match tree {
+            syn::UseTree::Path(p) => terminal(&p.tree),
+            other => other,
+        }
+    }
+
+    // Expand `[start, end)` (a `use …;` span) to cover its whole line: leading
+    // indentation and one trailing newline, so no blank line is left behind.
+    let remove_line = |start: usize, end: usize| -> Edit {
+        let mut s = start;
+        while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+            s -= 1;
+        }
+        let mut e = end;
+        if e < bytes.len() && bytes[e] == b'\r' {
+            e += 1;
+        }
+        if e < bytes.len() && bytes[e] == b'\n' {
+            e += 1;
+        }
+        Edit {
+            start: s,
+            end: e,
+            text: String::new(),
+        }
+    };
+
+    let mut edits: Vec<Edit> = Vec::new();
+    for (item, &(item_start, item_end)) in uc.items.iter().zip(use_ranges.iter()) {
+        // Only PRIVATE (inherited-visibility) imports are prune candidates. A
+        // `pub use` / `pub(crate) use` is a re-export — removing it silently drops
+        // a public API item, and an unused `pub use` emits NO warning, so the
+        // whole-run `cargo check` rollback would not catch the breakage. Leave any
+        // non-private `use` (including a group under it) entirely untouched.
+        if !matches!(item.vis, syn::Visibility::Inherited) {
+            continue;
+        }
+        let cur = (item_start, item_end);
+        match terminal(&item.tree) {
+            // `use a::b::Name;`
+            syn::UseTree::Name(n) => {
+                if should_remove(&n.ident.to_string(), cur) {
+                    edits.push(remove_line(item_start, item_end));
+                }
+            }
+            // `use a::b::{X, Y, Z};` — only all-plain-name groups are edited.
+            syn::UseTree::Group(g) => {
+                let mut names: Vec<String> = Vec::new();
+                let mut all_plain = true;
+                for m in &g.items {
+                    match m {
+                        syn::UseTree::Name(n) => names.push(n.ident.to_string()),
+                        _ => {
+                            all_plain = false;
+                            break;
+                        }
+                    }
+                }
+                if !all_plain {
+                    continue;
+                }
+                let kept: Vec<&str> = names
+                    .iter()
+                    .filter(|n| !should_remove(n, cur))
+                    .map(String::as_str)
+                    .collect();
+                if kept.len() == names.len() {
+                    continue; // nothing to remove
+                }
+                if kept.is_empty() {
+                    edits.push(remove_line(item_start, item_end));
+                } else {
+                    let brace = g.brace_token.span.join().byte_range();
+                    edits.push(Edit {
+                        start: brace.start,
+                        end: brace.end,
+                        text: format!("{{{}}}", kept.join(", ")),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if edits.is_empty() {
+        return src.to_string();
+    }
+    apply_edits(src, edits)
 }
 
 // ── Unified diff (dependency-free) ──────────────────────────────────────────
@@ -1989,6 +2350,213 @@ impl Foo {
         assert!(d.contains("+B"));
         // Identical inputs -> empty diff.
         assert!(unified_diff("x.rs", old, old).is_empty());
+    }
+
+    // ── FIX 1: public `with_time` builder ─────────────────────────────────────
+
+    #[test]
+    fn migrated_struct_gets_public_with_time_builder() {
+        let src = r#"
+struct Foo { n: u64 }
+impl Foo {
+    fn new() -> Self { Foo { n: 0 } }
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let out = modified(src);
+        // The PUBLIC consuming builder is generated, once.
+        assert!(
+            out.contains(
+                "pub fn with_time(mut self, time: std::sync::Arc<dyn navian_dst::Time>) -> Self"
+            ),
+            "expected a public with_time builder:\n{out}"
+        );
+        assert_eq!(
+            out.matches("fn with_time").count(),
+            1,
+            "with_time must be added exactly once:\n{out}"
+        );
+        // It lands inside the inherent impl (before the constructor).
+        assert!(
+            out.contains("self.time = time;"),
+            "with_time body missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn with_time_is_not_duplicated_when_already_present() {
+        // The struct still has an un-rewritten leak (so it IS migrated), but it
+        // already defines a `with_time` method — we must NOT add a second one.
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn with_time(mut self, time: std::sync::Arc<dyn navian_dst::Time>) -> Self {
+        self.time = time;
+        self
+    }
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let r = plan(src);
+        let out = r
+            .changes
+            .first()
+            .map(|c| c.modified.clone())
+            .expect("Foo is migrated");
+        // Leak rewritten and field added, but with_time NOT duplicated.
+        assert!(out.contains("self.time.instant_now()"), "got:\n{out}");
+        assert!(
+            out.contains("time: std::sync::Arc<dyn navian_dst::Time>,"),
+            "field must be added:\n{out}"
+        );
+        assert_eq!(
+            out.matches("fn with_time").count(),
+            1,
+            "existing with_time must not be duplicated:\n{out}"
+        );
+    }
+
+    #[test]
+    fn with_time_survives_second_run_idempotently() {
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let once = modified(src);
+        assert_eq!(
+            once.matches("fn with_time").count(),
+            1,
+            "first run adds with_time once:\n{once}"
+        );
+        let twice = modified(&once);
+        assert_eq!(once, twice, "second run must be a no-op:\n{twice}");
+    }
+
+    #[test]
+    fn with_time_goes_in_the_impl_that_contains_the_rewrite() {
+        // A generic struct with TWO inherent impls: a specialized `impl Foo<u8>`
+        // and the general `impl<T> Foo<T>` that holds the migrated method. The
+        // `with_time` builder must land in the GENERAL impl (where `self.time` is
+        // used), not the specialized one — otherwise `Self` would be `Foo<u8>`.
+        let src = r#"
+struct Foo<T> { x: T }
+impl Foo<u8> {
+    fn special(&self) -> u8 { self.x }
+}
+impl<T> Foo<T> {
+    fn new(x: T) -> Self { Self { x } }
+    fn tick(&self) -> std::time::Instant { Instant::now() }
+}
+"#;
+        let out = modified(src);
+        assert_eq!(
+            out.matches("fn with_time").count(),
+            1,
+            "with_time added exactly once:\n{out}"
+        );
+        // Placed at the top of the GENERAL impl block.
+        assert!(
+            out.contains("impl<T> Foo<T> {\n    /// Inject a clock for deterministic tests"),
+            "with_time must be in the general impl<T> Foo<T> block:\n{out}"
+        );
+        // The specialized impl is left untouched.
+        assert!(
+            out.contains("impl Foo<u8> {\n    fn special"),
+            "specialized impl Foo<u8> must not receive with_time:\n{out}"
+        );
+    }
+
+    // ── FIX 2: dead time-import pruning ────────────────────────────────────────
+
+    #[test]
+    fn removes_dead_instant_import_after_rewrite() {
+        // `Instant` is used ONLY at the rewritten leak site → its import becomes
+        // dead and must be removed.
+        let src = r#"
+use std::time::Instant;
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn tick(&self) { let _ = Instant::now(); }
+}
+"#;
+        let out = modified(src);
+        assert!(out.contains("self.time.instant_now()"), "got:\n{out}");
+        assert!(
+            !out.contains("use std::time::Instant"),
+            "dead Instant import must be removed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn keeps_pub_use_reexport_even_when_locally_unused() {
+        // A `pub use std::time::Instant;` is a PUBLIC re-export. Even when the
+        // only local `Instant` reference is the rewritten leak, the re-export must
+        // survive: an unused `pub use` emits NO warning, so the whole-run cargo
+        // check would NOT catch its removal, silently breaking downstream users of
+        // `mycrate::Instant`.
+        let src = r#"
+pub use std::time::Instant;
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn tick(&self) { let _ = Instant::now(); }
+}
+"#;
+        let out = modified(src);
+        assert!(out.contains("self.time.instant_now()"), "got:\n{out}");
+        assert!(
+            out.contains("pub use std::time::Instant;"),
+            "public re-export must be preserved:\n{out}"
+        );
+    }
+
+    #[test]
+    fn keeps_time_import_still_referenced_elsewhere() {
+        // `Instant` is still used as a return type after the rewrite → its import
+        // must be preserved.
+        let src = r#"
+use std::time::Instant;
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn mono(&self) -> Instant { Instant::now() }
+}
+"#;
+        let out = modified(src);
+        assert!(out.contains("self.time.instant_now()"), "got:\n{out}");
+        assert!(
+            out.contains("use std::time::Instant;"),
+            "still-used Instant import must be kept:\n{out}"
+        );
+    }
+
+    #[test]
+    fn prunes_only_the_dead_name_from_a_group_import() {
+        // `Duration` stays in use (a param type); `Instant` becomes dead. Only
+        // `Instant` is dropped from the group; `Duration` is preserved.
+        let src = r#"
+use std::time::{Duration, Instant};
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn nap(&self, d: Duration) { let _ = d; let _ = Instant::now(); }
+}
+"#;
+        let out = modified(src);
+        assert!(out.contains("self.time.instant_now()"), "got:\n{out}");
+        assert!(
+            out.contains("use std::time::{Duration};"),
+            "group must keep Duration and drop Instant:\n{out}"
+        );
+        assert!(
+            !out.contains("Instant"),
+            "Instant must be gone entirely:\n{out}"
+        );
     }
 
     #[test]

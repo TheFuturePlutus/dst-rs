@@ -302,11 +302,29 @@ struct LeakVisitor<'a> {
 impl LeakVisitor<'_> {
     fn record(&mut self, cat: Category, span: proc_macro2::Span) {
         let start = span.start();
+        let line = start.line;
+        let col = start.column + 1;
+        // Deduplicate a NESTED leak that shares the same start position and
+        // category as one already recorded. The canonical case is
+        // `rand::thread_rng().gen()`: the outer `.gen()` method call and the
+        // inner `thread_rng()` call both begin at the same `line:col`, so the
+        // site would otherwise be reported twice. The outer/most-specific match
+        // is visited first (a method call is recorded before we recurse into its
+        // receiver), so keeping the first-seen leak at a `(line, col, category)`
+        // drops only the nested duplicate. Genuinely distinct leaks never share a
+        // start position, so this never merges separate findings.
+        if self
+            .leaks
+            .iter()
+            .any(|l| l.line == line && l.col == col && l.category == cat)
+        {
+            return;
+        }
         let snippet = snippet_from_span(self.lines, span);
         self.leaks.push(Leak {
             file: self.file.to_string(),
-            line: start.line,
-            col: start.column + 1,
+            line,
+            col,
             category: cat,
             snippet,
             func: self.fn_stack.last().cloned(),
@@ -691,6 +709,41 @@ mod tests {
         assert!(
             any_of(&leaks, Category::Random),
             "user Source::OsRng variant IS flagged (accepted FP): {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn nested_thread_rng_gen_is_one_finding_not_two() {
+        // `rand::thread_rng().gen()` fires for BOTH the outer `.gen()` method
+        // call and the inner `thread_rng()` call, at the SAME `line:col`. It must
+        // deduplicate to exactly one RANDOM finding (the outermost / most
+        // specific), not two.
+        let leaks = scan("fn f() { let x: u8 = rand::thread_rng().gen(); }");
+        let random: Vec<_> = leaks
+            .iter()
+            .filter(|l| l.category == Category::Random)
+            .collect();
+        assert_eq!(
+            random.len(),
+            1,
+            "nested thread_rng().gen() must yield exactly one RANDOM leak: {leaks:#?}"
+        );
+    }
+
+    #[test]
+    fn distinct_rng_calls_on_same_line_are_not_merged() {
+        // Two genuinely distinct RNG calls (different columns) must both be
+        // reported — dedup keys on the exact start position, so it never merges
+        // separate findings that merely share a line.
+        let leaks = scan("fn f() { let _ = (thread_rng(), thread_rng()); }");
+        let random: Vec<_> = leaks
+            .iter()
+            .filter(|l| l.category == Category::Random)
+            .collect();
+        assert_eq!(
+            random.len(),
+            2,
+            "two distinct thread_rng() calls must both be flagged: {leaks:#?}"
         );
     }
 

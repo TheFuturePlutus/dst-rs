@@ -77,6 +77,15 @@ enum Commands {
         /// Trait families to migrate. v1 supports only `time`.
         #[arg(long, default_value = "time", value_delimiter = ',')]
         traits: Vec<String>,
+
+        /// Also gate on `cargo test --doc` after the `cargo check --all-targets`
+        /// gate passes, rolling the whole run back if any doctest fails.
+        ///
+        /// OFF by default: doctests can only be verified by RUNNING them (cargo
+        /// rejects `--no-run` for `--doc`), which executes user code and is slow.
+        /// When off, migrate warns that doctests were not verified.
+        #[arg(long)]
+        check_doctests: bool,
     },
 }
 
@@ -102,6 +111,7 @@ fn main() -> ExitCode {
             path,
             dry_run,
             traits,
+            check_doctests,
         } => {
             // v1 only supports `time`. Reject anything else explicitly rather
             // than silently ignoring it.
@@ -124,6 +134,7 @@ fn main() -> ExitCode {
             let opts = MigrateOptions {
                 dry_run,
                 traits: families,
+                check_doctests,
             };
             let result = migrate_path(&path, &opts);
             emit_migrate(&result, dry_run)
@@ -187,6 +198,18 @@ fn emit_migrate(result: &MigrateResult, dry_run: bool) -> ExitCode {
         match &result.check {
             CheckOutcome::Passed => {
                 println!("\n  cargo check: PASSED — changes applied.");
+                if result.doctests_checked {
+                    println!("  cargo test --doc: PASSED.");
+                } else if !result.structs_migrated.is_empty() {
+                    // Never let the doctest gap ship silently.
+                    println!(
+                        "\n  Note: doctests are not verified (cargo cannot compile-check \
+                         doctests without running them; --all-targets excludes them). If any \
+                         migrated struct is constructed in a doctest, run `cargo test --doc` and \
+                         update struct-literal construction to use the constructor / `with_time`. \
+                         Re-run with --check-doctests to gate on doctests automatically."
+                    );
+                }
             }
             CheckOutcome::Skipped => {
                 if result.no_op {
@@ -196,7 +219,14 @@ fn emit_migrate(result: &MigrateResult, dry_run: bool) -> ExitCode {
                 }
             }
             CheckOutcome::Failed(err) => {
-                println!("\n  cargo check: FAILED — original files RESTORED.");
+                println!(
+                    "\n  cargo check: FAILED (--all-targets) — a build target no longer \
+                     compiles after the rewrite; ALL original files RESTORED (nothing applied).\n\
+                     \x20 This can happen when a struct is built via a struct literal OUTSIDE \
+                     its module (e.g. in tests/ or examples/), where the injected private \
+                     `time` field is inaccessible — that struct needs a public constructor; \
+                     migrate it manually / with an agent."
+                );
                 eprintln!("{err}");
                 return ExitCode::FAILURE;
             }

@@ -69,6 +69,19 @@ fn run_migrate(path: &Path, target: &Path, extra: &[&str]) -> (bool, String) {
     )
 }
 
+/// Run `cargo check --all-targets` in `dir` with the shared target dir.
+fn cargo_check_all_targets(dir: &Path, target: &Path) -> (bool, String) {
+    let out = Command::new("cargo")
+        .args(["check", "--all-targets"])
+        .current_dir(dir)
+        .env("CARGO_TARGET_DIR", target)
+        .output()
+        .expect("failed to spawn cargo");
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.success(), combined)
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -178,6 +191,105 @@ fn failing_migrate_is_dirty_worktree_safe_and_rolls_back_exact_bytes() {
     );
 }
 
+// ── The internal gate is `--all-targets`: migrate never ships a tree that fails
+//    `cargo check --all-targets` (a public struct built via a literal in an
+//    integration test would otherwise break only the test target). ─────────────
+
+#[test]
+fn migrate_rolls_back_when_it_would_break_an_integration_test() {
+    let scratch = Scratch::new("extlit");
+    let app = scratch.root.join("app");
+    let target = scratch.root.join("target");
+    let src = app.join("src");
+    let tests = app.join("tests");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&tests).unwrap();
+
+    // Depends on navian-dst so the migrated lib itself WOULD compile — the ONLY
+    // break is in the integration-test target, which a lib-only check misses.
+    let abs = navian_dst_dir();
+    std::fs::write(
+        app.join("Cargo.toml"),
+        format!(
+            "[workspace]\n\n[package]\nname = \"extlit\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\nnavian-dst = {{ path = {:?} }}\n",
+            abs.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    // A PUBLIC struct with a migratable leak. `id` is public so an external crate
+    // can build it via a struct literal.
+    std::fs::write(
+        src.join("lib.rs"),
+        "use std::time::Instant;\n\
+         pub struct PublicFoo { pub id: u32 }\n\
+         impl PublicFoo {\n\
+         \x20   pub fn new(id: u32) -> Self { Self { id } }\n\
+         \x20   pub fn tick(&self) -> Instant { Instant::now() }\n\
+         }\n",
+    )
+    .unwrap();
+
+    // Integration test (a SEPARATE crate) that builds PublicFoo via a struct
+    // literal — outside the struct's module, so migrate cannot rewrite it, and
+    // after the private `time` field is injected this target no longer compiles.
+    std::fs::write(
+        tests.join("it.rs"),
+        "use extlit::PublicFoo;\n\
+         #[test]\n\
+         fn builds_via_literal() {\n\
+         \x20   let foo = PublicFoo { id: 9 };\n\
+         \x20   assert_eq!(foo.id, 9);\n\
+         }\n",
+    )
+    .unwrap();
+
+    let lib_rs = src.join("lib.rs");
+    let it_rs = tests.join("it.rs");
+
+    // Sanity: everything compiles across ALL targets before migration.
+    let (ok, log) = cargo_check_all_targets(&app, &target);
+    assert!(
+        ok,
+        "fixture must compile (all targets) before migration:\n{log}"
+    );
+
+    let lib_before = read(&lib_rs);
+    let it_before = read(&it_rs);
+
+    // Migrate ONLY src/. The internal `--all-targets` gate must catch the break
+    // in the integration-test target and roll the WHOLE run back.
+    let (ok, out) = run_migrate(&src, &target, &[]);
+    assert!(
+        !ok,
+        "migrate must exit non-zero when it would break any target:\n{out}"
+    );
+    assert!(
+        out.contains("FAILED") && out.contains("RESTORED"),
+        "migrate must report the target failure and the restore:\n{out}"
+    );
+
+    // Rolled back to EXACT pre-migration bytes — nothing applied.
+    assert_eq!(
+        read(&lib_rs),
+        lib_before,
+        "lib.rs must be restored exactly (migration must not ship)"
+    );
+    assert_eq!(
+        read(&it_rs),
+        it_before,
+        "the integration test must be byte-identical"
+    );
+
+    // The invariant: the tree still compiles across ALL targets (leak left
+    // un-migrated, which is the correct safe outcome).
+    let (ok, log) = cargo_check_all_targets(&app, &target);
+    assert!(
+        ok,
+        "after rollback the tree must be green under `cargo check --all-targets`:\n{log}"
+    );
+}
+
 // ── B4: --dry-run changes nothing on disk ────────────────────────────────────
 
 #[test]
@@ -283,5 +395,142 @@ fn constructor_and_struct_literal_both_compile_after_migrate() {
     assert_eq!(
         defaults, 2,
         "both the constructor and the direct struct literal must be defaulted:\n{migrated}"
+    );
+}
+
+// ── Doctest gate: opt-in `--check-doctests`, plus a default warning ───────────
+//
+// `cargo check --all-targets` cannot verify doctests (cargo only checks them by
+// RUNNING them), so a struct built via a literal inside a doc example is a gap.
+// `--check-doctests` closes it (roll back on doctest failure); by default migrate
+// still applies but WARNS so the gap is never silent.
+
+/// Write a crate depending on navian-dst whose lib is `src/lib.rs` = `lib_src`,
+/// with package/crate name `name`. Returns (app_dir, src_dir).
+fn write_dep_crate(scratch: &Scratch, name: &str, lib_src: &str) -> (PathBuf, PathBuf) {
+    let app = scratch.root.join("app");
+    let src = app.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let abs = navian_dst_dir();
+    std::fs::write(
+        app.join("Cargo.toml"),
+        format!(
+            "[workspace]\n\n[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\n\n[dependencies]\nnavian-dst = {{ path = {:?} }}\n",
+            abs.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    std::fs::write(src.join("lib.rs"), lib_src).unwrap();
+    (app, src)
+}
+
+/// A lib whose PUBLIC struct is built via a struct LITERAL inside a doctest —
+/// migration adds the private `time` field and breaks that doctest.
+const DOCTEST_LITERAL_LIB: &str = "use std::time::Instant;\n\
+     /// A widget.\n\
+     ///\n\
+     /// ```\n\
+     /// use doclit::PublicFoo;\n\
+     /// let f = PublicFoo { id: 4 };\n\
+     /// assert_eq!(f.id, 4);\n\
+     /// ```\n\
+     pub struct PublicFoo { pub id: u32 }\n\
+     impl PublicFoo {\n\
+     \x20   pub fn new(id: u32) -> Self { Self { id } }\n\
+     \x20   pub fn tick(&self) -> Instant { Instant::now() }\n\
+     }\n";
+
+#[test]
+fn check_doctests_gate_rolls_back_when_a_doctest_builds_via_literal() {
+    let scratch = Scratch::new("doclit");
+    let target = scratch.root.join("target");
+    let (_app, src) = write_dep_crate(&scratch, "doclit", DOCTEST_LITERAL_LIB);
+    let lib_rs = src.join("lib.rs");
+    let before = read(&lib_rs);
+
+    // With --check-doctests, the doctest gate runs after --all-targets passes,
+    // catches the broken doctest, and rolls the WHOLE run back.
+    let (ok, out) = run_migrate(&src, &target, &["--check-doctests"]);
+    assert!(
+        !ok,
+        "migrate --check-doctests must exit non-zero on a broken doctest:\n{out}"
+    );
+    assert!(
+        out.contains("FAILED") && out.contains("RESTORED"),
+        "migrate must report the doctest failure and the restore:\n{out}"
+    );
+    assert_eq!(
+        read(&lib_rs),
+        before,
+        "lib.rs must be restored exactly — a broken doctest must not ship"
+    );
+}
+
+#[test]
+fn without_flag_migrates_but_warns_that_doctests_are_unverified() {
+    let scratch = Scratch::new("docwarn");
+    let target = scratch.root.join("target");
+    // Same crate, but package name `doclit` so the doctest path matches; without
+    // --check-doctests migrate APPLIES (the doctest gap is not gated) and warns.
+    let (_app, src) = write_dep_crate(&scratch, "doclit", DOCTEST_LITERAL_LIB);
+    let lib_rs = src.join("lib.rs");
+
+    let (ok, out) = run_migrate(&src, &target, &[]);
+    assert!(ok, "migrate must succeed without the doctest gate:\n{out}");
+    assert!(
+        out.contains("cargo check: PASSED"),
+        "the --all-targets gate must pass:\n{out}"
+    );
+    // The gap must be surfaced, not silent.
+    assert!(
+        out.contains("doctests are not verified")
+            && out.contains("--check-doctests"),
+        "migrate must warn that doctests were not verified:\n{out}"
+    );
+    // It did apply the rewrite (shipping, with the warning).
+    let migrated = std::fs::read_to_string(&lib_rs).unwrap();
+    assert!(
+        migrated.contains("self.time.instant_now()"),
+        "the leak should have been rewritten:\n{migrated}"
+    );
+}
+
+#[test]
+fn check_doctests_gate_allows_a_passing_doctest() {
+    // A doctest that builds the struct via its CONSTRUCTOR keeps working after
+    // migration (the field defaults to production), so --check-doctests must NOT
+    // falsely roll it back.
+    let lib_src = "use std::time::Instant;\n\
+         /// A widget.\n\
+         ///\n\
+         /// ```\n\
+         /// use docok::PublicFoo;\n\
+         /// let f = PublicFoo::new(4);\n\
+         /// assert_eq!(f.id(), 4);\n\
+         /// ```\n\
+         pub struct PublicFoo { id: u32 }\n\
+         impl PublicFoo {\n\
+         \x20   pub fn new(id: u32) -> Self { Self { id } }\n\
+         \x20   pub fn id(&self) -> u32 { self.id }\n\
+         \x20   pub fn tick(&self) -> Instant { Instant::now() }\n\
+         }\n";
+    let scratch = Scratch::new("docok");
+    let target = scratch.root.join("target");
+    let (_app, src) = write_dep_crate(&scratch, "docok", lib_src);
+    let lib_rs = src.join("lib.rs");
+
+    let (ok, out) = run_migrate(&src, &target, &["--check-doctests"]);
+    assert!(
+        ok,
+        "migrate --check-doctests must succeed when doctests pass:\n{out}"
+    );
+    assert!(
+        out.contains("cargo check: PASSED") && out.contains("cargo test --doc: PASSED"),
+        "both gates must pass:\n{out}"
+    );
+    let migrated = std::fs::read_to_string(&lib_rs).unwrap();
+    assert!(
+        migrated.contains("self.time.instant_now()"),
+        "the leak must have been rewritten (change applied):\n{migrated}"
     );
 }

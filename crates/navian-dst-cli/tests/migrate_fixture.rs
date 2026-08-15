@@ -249,9 +249,36 @@ mod injected_sim_test {
     with_test.push_str(sim_test);
     std::fs::write(&lib_rs, with_test).unwrap();
 
+    // External-style injection: a SEPARATE test crate (an integration test) can
+    // only touch PUBLIC API, so it MUST go through the generated `with_time`
+    // builder — the private `time` field is inaccessible (E0451) without it. This
+    // proves the builder is public AND actually routes the injected clock.
+    let tests_dir = app.join("tests");
+    std::fs::create_dir_all(&tests_dir).unwrap();
+    std::fs::write(
+        tests_dir.join("inject.rs"),
+        r#"
+use app::RateLimiter;
+use navian_dst::SimulatedTime;
+use std::sync::Arc;
+
+#[test]
+fn external_with_time_injection_uses_the_injected_clock() {
+    let clock = Arc::new(SimulatedTime::new(4_242));
+    // PUBLIC API only: `new` + the generated `with_time` consuming builder.
+    let rl = RateLimiter::new(5).with_time(clock.clone());
+    assert_eq!(rl.now_ms(), 4_242);
+    clock.advance_ms(100);
+    assert_eq!(rl.now_ms(), 4_342);
+}
+"#,
+    )
+    .unwrap();
+
     let (ok, log) = cargo(&app, &target, &["test"]);
     assert!(
-        ok && log.contains("deterministic_under_simulated_clock") && log.contains("1 passed"),
-        "SimulatedTime injection test must pass deterministically:\n{log}"
+        ok && log.contains("deterministic_under_simulated_clock")
+            && log.contains("external_with_time_injection_uses_the_injected_clock"),
+        "SimulatedTime injection tests (in-crate field + external builder) must pass:\n{log}"
     );
 }
