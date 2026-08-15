@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 mod baseline;
+mod check;
 mod migrate;
 mod scanner;
 
@@ -175,6 +176,73 @@ enum Commands {
     /// commented config template. Existing files are left untouched and
     /// reported as skipped.
     Init,
+
+    /// Run a command several times under one fixed seed and report whether its
+    /// output is IDENTICAL (deterministic) or DIVERGES (nondeterminism escaped).
+    ///
+    /// This is the dynamic "run twice, diff" determinism gesture: a correctly
+    /// seeded run reproduces byte-for-byte, so anything that varies run-to-run —
+    /// an unseeded clock, real RNG, `HashMap` iteration order, thread
+    /// interleaving — shows up here even though the static `scan` never sees it.
+    ///
+    /// HANGS: without `--timeout`, a command that HANGS will hang `check` — a
+    /// hang is NOT auto-surfaced as a divergence. A deadlock (a classic
+    /// thread-interleaving symptom) manifests as an indefinite hang, not a
+    /// reported difference. Pass `--timeout <secs>` to kill and REPORT an
+    /// overrunning run instead of blocking forever.
+    ///
+    /// SEEDING, HONESTLY: the navian-dst LIBRARY takes its seed through its API
+    /// (`SimulatedRandom::from_seed`, `FaultSchedule::new`, the `SimScheduler`),
+    /// NOT from the environment. `check` cannot force a seed onto library code —
+    /// it exports `NAVIAN_DST_SEED` and `SEED` for the command to consult IF it
+    /// chooses, and otherwise just runs the command and diffs the output. So this
+    /// catches gross / escaped nondeterminism; it does not itself make a program
+    /// deterministic.
+    ///
+    /// The command's stdout should be deterministic under a fixed seed — point it
+    /// at a test/binary that prints a STATE SNAPSHOT or a REPLAY HASH, not at raw
+    /// `cargo test` (its "finished in 0.03s" timing always differs and would cry
+    /// wolf). Use `--ignore <regex>` (repeatable) to drop matching lines — e.g.
+    /// timestamps or timings — before comparison.
+    ///
+    /// SEMANTICS: `check` measures DIVERGENCE, not pass/fail. A command that FAILS
+    /// identically every run is "deterministic" (exit 0); only differing
+    /// (filtered stdout, exit status) is a divergence (exit 1). Only stdout and
+    /// exit status are compared — stderr is captured and shown but not compared.
+    ///
+    /// Exit codes: 0 = identical across all runs; 1 = a run diverged; 2 = usage
+    /// error (bad `--runs`/`--ignore`, or the command could not be spawned).
+    Check {
+        /// Seed exported to every run (as `NAVIAN_DST_SEED` and `SEED`) so the
+        /// runs are directly comparable. Default 0.
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// How many times to run the command. Must be >= 2. Default 2.
+        #[arg(long, default_value_t = 2)]
+        runs: u32,
+
+        /// Kill any run that exceeds this many seconds and REPORT it as a
+        /// timeout (exit 1). Without this, a hanging/deadlocked command hangs
+        /// `check` indefinitely. Must be >= 1.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+
+        /// Drop stdout lines matching this regex before comparing (repeatable).
+        /// Use it to strip timestamps/timings that legitimately vary.
+        #[arg(long = "ignore", value_name = "REGEX")]
+        ignore: Vec<String>,
+
+        /// The command to run, then its arguments. Put it after `--` so its own
+        /// flags are not parsed by `check` (e.g. `check -- cargo run --quiet`).
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            required = true,
+            value_name = "COMMAND"
+        )]
+        command: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -398,6 +466,13 @@ fn main() -> ExitCode {
             }
         }
         Commands::Init => init_scaffold(),
+        Commands::Check {
+            seed,
+            runs,
+            timeout,
+            ignore,
+            command,
+        } => check::run_check(seed, runs, timeout, &ignore, &command),
     }
 }
 
