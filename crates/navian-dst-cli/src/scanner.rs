@@ -187,6 +187,18 @@ impl Confidence {
         }
     }
 
+    /// SARIF `result.level` for this tier: `error` / `warning` / `note`.
+    ///
+    /// The mapping is the conventional SARIF severity ladder — a High finding
+    /// is the tier the default gate fails on, so it maps to `error`.
+    pub fn sarif_level(self) -> &'static str {
+        match self {
+            Confidence::High => "error",
+            Confidence::Medium => "warning",
+            Confidence::Advisory => "note",
+        }
+    }
+
     /// Parse a `--deny-level` value.
     pub fn parse(s: &str) -> Option<Confidence> {
         match s {
@@ -497,6 +509,45 @@ pub struct Leak {
     /// Enclosing function name, if the leak sits inside a `fn`.
     pub function: Option<String>,
     pub snippet: String,
+}
+
+/// A stable, **line-independent** fingerprint of a finding.
+///
+/// This is the shared identity used by both the SARIF `partialFingerprints`
+/// (`dstFingerprintV1`) and the `baseline` suppression store, so the two always
+/// agree on what "the same finding" means.
+///
+/// The hash is taken over `rule_id + enclosing function + normalized snippet`
+/// and deliberately does **NOT** include the file path, line, or column — so a
+/// finding that MOVES (blank lines inserted above it, the enclosing block
+/// shifted, the file reformatted) keeps the same fingerprint and stays
+/// suppressed. The snippet is whitespace-normalized (runs of whitespace
+/// collapsed to a single space, ends trimmed) so pure re-indentation does not
+/// change the identity either.
+///
+/// The digest is a 64-bit FNV-1a rendered as 16 lowercase hex chars. FNV-1a is
+/// used rather than [`std::hash::DefaultHasher`] on purpose: `DefaultHasher`'s
+/// output is explicitly NOT guaranteed stable across Rust releases, and a
+/// baseline must survive a toolchain bump.
+pub fn fingerprint(leak: &Leak) -> String {
+    let func = leak.function.as_deref().unwrap_or("");
+    let snippet_norm = leak.snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    // U+001F (unit separator) delimits the fields so distinct field boundaries
+    // can never be forged by adjacent content (e.g. a snippet that ends in the
+    // same text a function name begins with).
+    let composed = format!("{}\u{1f}{}\u{1f}{}", leak.rule_id, func, snippet_norm);
+    format!("{:016x}", fnv1a64(composed.as_bytes()))
+}
+
+/// 64-bit FNV-1a. Deterministic and stable across platforms/toolchains, which
+/// is why the fingerprint uses it (see [`fingerprint`]).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Aggregate result of a scan run.
@@ -1790,5 +1841,62 @@ mod tests {
         scan_source("bad.rs", "fn f( { this is not rust", &mut report);
         assert!(report.uncertifiable(), "a parse failure must be uncertifiable");
         assert_eq!(report.files_parsed, 0);
+    }
+
+    // ── Fingerprint: stable identity shared by SARIF + baseline ─────────────
+
+    fn leak_at(line: usize, col: usize) -> Leak {
+        Leak {
+            rule_id: "DST-TIME-001",
+            confidence: Confidence::High,
+            category: Category::Time,
+            file: "src/lib.rs".to_string(),
+            line,
+            col,
+            function: Some("handler".to_string()),
+            snippet: "SystemTime::now()".to_string(),
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_line_and_column_independent() {
+        // Same rule + function + snippet at a different line/column (the finding
+        // "moved" because blank lines were inserted above it) → identical id.
+        assert_eq!(
+            fingerprint(&leak_at(10, 9)),
+            fingerprint(&leak_at(42, 13)),
+            "fingerprint must not depend on line/column"
+        );
+    }
+
+    #[test]
+    fn fingerprint_is_indentation_independent() {
+        // Pure re-indentation of the snippet must not change the identity.
+        let mut a = leak_at(1, 1);
+        a.snippet = "SystemTime::now()".to_string();
+        let mut b = leak_at(1, 1);
+        b.snippet = "SystemTime::now()   ".to_string();
+        assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    #[test]
+    fn fingerprint_differs_on_rule_function_or_snippet() {
+        let base = leak_at(1, 1);
+        let mut other_rule = base.clone();
+        other_rule.rule_id = "DST-TIME-002";
+        let mut other_fn = base.clone();
+        other_fn.function = Some("other".to_string());
+        let mut other_snip = base.clone();
+        other_snip.snippet = "Instant::now()".to_string();
+        assert_ne!(fingerprint(&base), fingerprint(&other_rule));
+        assert_ne!(fingerprint(&base), fingerprint(&other_fn));
+        assert_ne!(fingerprint(&base), fingerprint(&other_snip));
+    }
+
+    #[test]
+    fn fingerprint_is_16_hex_chars() {
+        let fp = fingerprint(&leak_at(1, 1));
+        assert_eq!(fp.len(), 16);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

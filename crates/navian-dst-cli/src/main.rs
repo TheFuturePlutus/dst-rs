@@ -8,19 +8,37 @@
 
 #![warn(missing_docs)]
 
+mod baseline;
 mod migrate;
 mod scanner;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
+use baseline::Baseline;
 use migrate::{migrate_path, CheckOutcome, MigrateOptions, MigrateResult, TraitFamily};
-use scanner::{rule_by_id, scan_path, Category, Confidence, ScanReport};
+use scanner::{fingerprint, rule_by_id, scan_path, Category, Confidence, ScanReport};
 
 /// Exit code for a tool/usage error (bad args, unreadable path).
 const EXIT_USAGE: u8 = 2;
+
+/// Landing page for the tool, embedded in SARIF output and scaffolding.
+const INFORMATION_URI: &str = "https://github.com/TheFuturePlutus/navian-dst";
+
+/// Output format for `scan`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// Human-readable report grouped by category (default).
+    Human,
+    /// The stable leak array as JSON (same as the legacy `--json` flag).
+    Json,
+    /// SARIF 2.1.0 — for GitHub code scanning and other SARIF consumers.
+    Sarif,
+    /// GitHub Actions workflow commands (`::error`/`::warning`/`::notice`).
+    Github,
+}
 
 #[derive(Parser)]
 #[command(
@@ -51,9 +69,21 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Emit machine-readable JSON instead of a human report.
+        /// Output format: `human` (default), `json`, `sarif`, or `github`.
+        #[arg(long, value_enum, value_name = "human|json|sarif|github")]
+        format: Option<Format>,
+
+        /// Emit machine-readable JSON instead of a human report. Back-compat
+        /// alias for `--format json`; `--format` wins if both are given.
         #[arg(long)]
         json: bool,
+
+        /// Suppress findings recorded in a baseline file (see the `baseline`
+        /// subcommand). A suppressed finding is dropped from output AND from the
+        /// `--deny` decision, so the gate fails only on NEW findings. A missing
+        /// or invalid baseline is a usage error (exit 2).
+        #[arg(long, value_name = "FILE")]
+        baseline: Option<PathBuf>,
 
         /// Turn `scan` into a CI gate: exit non-zero if any finding is at or
         /// above the deny threshold. Fails on `high`-confidence findings by
@@ -96,6 +126,31 @@ enum Commands {
         #[arg(long)]
         check_doctests: bool,
     },
+
+    /// Record the current findings to a baseline file so a later
+    /// `scan --baseline <file>` suppresses them.
+    ///
+    /// This is what lets a team turn on the `--deny` gate on a codebase that is
+    /// not yet clean: baseline the existing findings once, commit the file, and
+    /// thereafter the gate fails only on NEW findings. Each entry stores the
+    /// stable, line-independent fingerprint (shared with SARIF), plus the rule
+    /// id, file, and function for readability.
+    Baseline {
+        /// Directory (or file) to scan. Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Baseline file to write. Defaults to `navian-dst-baseline.json`.
+        #[arg(long, default_value = "navian-dst-baseline.json")]
+        out: PathBuf,
+    },
+
+    /// Scaffold navian-dst adoption in the current repo (never overwrites).
+    ///
+    /// Writes a GitHub Actions workflow that runs `scan --deny` as a gate and a
+    /// commented config template. Existing files are left untouched and
+    /// reported as skipped.
+    Init,
 }
 
 fn main() -> ExitCode {
@@ -103,10 +158,16 @@ fn main() -> ExitCode {
     match cli.command {
         Commands::Scan {
             path,
+            format,
             json,
+            baseline,
             deny,
             deny_level,
         } => {
+            // Resolve the output format. `--format` wins; the legacy `--json`
+            // flag is the back-compat alias for `--format json`.
+            let format = format.unwrap_or(if json { Format::Json } else { Format::Human });
+
             // Resolve the deny threshold. `--deny-level` implies `--deny` and
             // sets the bar; bare `--deny` fails on `high` only.
             let threshold = match deny_level.as_deref() {
@@ -122,6 +183,20 @@ fn main() -> ExitCode {
                 None => deny.then_some(Confidence::High),
             };
 
+            // Load the baseline BEFORE scanning: a missing/invalid baseline is a
+            // usage error (exit 2), unconditionally — never a silent no-op that
+            // would let the gate pass on a tree it did not really filter.
+            let mut suppress = match &baseline {
+                Some(bp) => match Baseline::load(bp) {
+                    Ok(b) => b.fingerprint_counts(),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(EXIT_USAGE);
+                    }
+                },
+                None => std::collections::HashMap::new(),
+            };
+
             // A path that does not exist is a usage error (exit 2), not a
             // "clean" scan — never let a typo look like a passing gate.
             if !path.exists() {
@@ -129,11 +204,54 @@ fn main() -> ExitCode {
                 return ExitCode::from(EXIT_USAGE);
             }
 
-            let report = scan_path(&path);
-            if json {
-                emit_json(&report);
-            } else {
-                emit_human(&report, threshold);
+            let mut report = scan_path(&path);
+
+            // Apply baseline suppression: drop findings whose fingerprint is in
+            // the baseline, from BOTH the output and the gate decision below.
+            // Count-bounded: at most `count` occurrences of each fingerprint are
+            // suppressed, so an ADDED identical leak (same rule/function/snippet
+            // in another file or a repeated call) exceeds the baseline count and
+            // survives to the gate as a NEW finding.
+            if let Some(bp) = &baseline {
+                let before = report.leaks.len();
+                report.leaks.retain(|l| {
+                    if let Some(remaining) = suppress.get_mut(&fingerprint(l)) {
+                        if *remaining > 0 {
+                            *remaining -= 1;
+                            return false; // within baseline budget → suppress
+                        }
+                    }
+                    true // no budget left → a NEW finding, keep it
+                });
+                let suppressed = before - report.leaks.len();
+                eprintln!(
+                    "suppressed {suppressed} finding(s) via baseline {}",
+                    bp.display()
+                );
+            }
+
+            match format {
+                Format::Human => emit_human(&report, threshold),
+                Format::Json => emit_json(&report),
+                Format::Sarif => emit_sarif(&report),
+                Format::Github => emit_github(&report),
+            }
+
+            // In a machine format WITHOUT a gate, skipped files would otherwise
+            // be invisible — the human report lists them and the gate exits 2 on
+            // them, but plain `scan --format sarif .` must not look "clean" for
+            // files it never analyzed. Warn on stderr so stdout stays valid.
+            if threshold.is_none()
+                && !matches!(format, Format::Human)
+                && !report.parse_failures.is_empty()
+            {
+                eprintln!(
+                    "warning: {} file(s) could not be read or parsed and were NOT analyzed:",
+                    report.parse_failures.len()
+                );
+                for f in &report.parse_failures {
+                    eprintln!("  {f}");
+                }
             }
 
             // Exit-code contract:
@@ -188,6 +306,129 @@ fn main() -> ExitCode {
             let result = migrate_path(&path, &opts);
             emit_migrate(&result, dry_run)
         }
+        Commands::Baseline { path, out } => {
+            // Same "missing path is a usage error" rule as scan.
+            if !path.exists() {
+                eprintln!("error: path does not exist: {}", path.display());
+                return ExitCode::from(EXIT_USAGE);
+            }
+            let report = scan_path(&path);
+            let baseline = Baseline::from_report(&report);
+            match std::fs::write(&out, baseline.to_pretty_json()) {
+                Ok(()) => {
+                    println!(
+                        "Baselined {} finding(s) → {}",
+                        baseline.findings.len(),
+                        out.display()
+                    );
+                    if !report.parse_failures.is_empty() {
+                        println!(
+                            "  note: {} file(s) could not be parsed and were not baselined:",
+                            report.parse_failures.len()
+                        );
+                        for f in &report.parse_failures {
+                            println!("    {f}");
+                        }
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("error: could not write baseline {}: {e}", out.display());
+                    ExitCode::from(EXIT_USAGE)
+                }
+            }
+        }
+        Commands::Init => init_scaffold(),
+    }
+}
+
+/// The GitHub Actions workflow written by `init`.
+const WORKFLOW_YML: &str = r#"# navian-dst — determinism-leak CI gate.
+# Generated by `navian-dst init`. Safe to edit.
+name: navian-dst
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  determinism-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install navian-dst
+        run: cargo install navian-dst-cli
+      - name: Determinism-leak gate
+        # Fails the build on high-confidence findings. Add `--deny-level medium`
+        # to tighten, or `--baseline navian-dst-baseline.json` to gate only on
+        # NEW findings while adopting on a dirty tree (see `navian-dst baseline`).
+        run: navian-dst scan --deny .
+
+      # --- Optional: upload results to GitHub code scanning instead of (or in
+      # --- addition to) failing inline. Uncomment to enable.
+      # - name: Determinism scan (SARIF)
+      #   if: always()
+      #   run: navian-dst scan --format sarif . > navian-dst.sarif
+      # - name: Upload SARIF
+      #   if: always()
+      #   uses: github/codeql-action/upload-sarif@v3
+      #   with:
+      #     sarif_file: navian-dst.sarif
+"#;
+
+/// The config template written by `init`.
+const CONFIG_TOML: &str = r#"# navian-dst.toml — TEMPLATE / stub.
+#
+# NOTE: This file is a TEMPLATE. The navian-dst CLI does NOT read it yet — the
+# keys below simply document the command-line flags you pass today. Editing
+# values here has NO effect on a scan; wiring this config into `scan` is planned
+# but not implemented. Use CLI flags for real behavior.
+
+# Confidence threshold the `--deny` gate fails on: "high" | "medium" | "advisory".
+# CLI equivalent today: navian-dst scan --deny-level high
+deny_level = "high"
+
+# Paths to exclude from scanning (example). NOT honored by the CLI yet.
+# exclude = ["target", "vendor", "third_party"]
+"#;
+
+/// Scaffold CI + config for adopting navian-dst. Conservative: never overwrites
+/// an existing file — it prints whether each path was created or skipped, and
+/// creates only what actually works today (the config is a labeled template).
+fn init_scaffold() -> ExitCode {
+    let files: [(&str, &str); 2] = [
+        (".github/workflows/navian-dst.yml", WORKFLOW_YML),
+        ("navian-dst.toml", CONFIG_TOML),
+    ];
+    let mut any_err = false;
+    for (rel, contents) in files {
+        let path = Path::new(rel);
+        if path.exists() {
+            println!("skip    {rel} (already exists — left untouched)");
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("error: could not create {}: {e}", parent.display());
+                    any_err = true;
+                    continue;
+                }
+            }
+        }
+        match std::fs::write(path, contents) {
+            Ok(()) => println!("create  {rel}"),
+            Err(e) => {
+                eprintln!("error: could not write {rel}: {e}");
+                any_err = true;
+            }
+        }
+    }
+    if any_err {
+        ExitCode::from(EXIT_USAGE)
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -291,6 +532,108 @@ fn emit_json(report: &ScanReport) {
     match serde_json::to_string_pretty(&report.leaks) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("failed to serialize leaks: {e}"),
+    }
+}
+
+/// A short, human-readable SARIF rule `name` derived from the description: the
+/// text before the em-dash (`SystemTime::now`), else the whole description.
+fn sarif_rule_name(description: &str) -> &str {
+    description.split(" — ").next().unwrap_or(description).trim()
+}
+
+/// Emit a SARIF 2.1.0 document.
+///
+/// One `reportingDescriptor` per catalog rule (the driver's rule set) and one
+/// `result` per finding. Each result carries `partialFingerprints`
+/// (`dstFingerprintV1`) so SARIF consumers can track a finding across moves —
+/// the same fingerprint the `baseline` store uses.
+fn emit_sarif(report: &ScanReport) {
+    use serde_json::json;
+
+    let rules: Vec<serde_json::Value> = scanner::rules::CATALOG
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "name": sarif_rule_name(r.description),
+                "shortDescription": { "text": r.description },
+                "defaultConfiguration": { "level": r.confidence.sarif_level() },
+            })
+        })
+        .collect();
+
+    let results: Vec<serde_json::Value> = report
+        .leaks
+        .iter()
+        .map(|l| {
+            let desc = rule_by_id(l.rule_id).map(|r| r.description).unwrap_or(l.rule_id);
+            json!({
+                "ruleId": l.rule_id,
+                "level": l.confidence.sarif_level(),
+                "message": { "text": format!("{desc}: {}", l.snippet) },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": l.file },
+                        "region": { "startLine": l.line, "startColumn": l.col },
+                    }
+                }],
+                "partialFingerprints": { "dstFingerprintV1": fingerprint(l) },
+            })
+        })
+        .collect();
+
+    let doc = json!({
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "navian-dst",
+                    "informationUri": INFORMATION_URI,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "rules": rules,
+                }
+            },
+            "results": results,
+        }],
+    });
+
+    match serde_json::to_string_pretty(&doc) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("failed to serialize SARIF: {e}"),
+    }
+}
+
+/// Escape the message portion of a GitHub workflow command (`%`, CR, LF). `%`
+/// MUST be escaped first so the introduced `%XX` sequences aren't re-escaped.
+fn gh_escape_data(s: &str) -> String {
+    s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
+}
+
+/// Escape a property value (e.g. `file=`), which additionally may not contain
+/// the `,`/`:` delimiters GitHub uses between properties.
+fn gh_escape_prop(s: &str) -> String {
+    gh_escape_data(s).replace(',', "%2C").replace(':', "%3A")
+}
+
+/// Emit GitHub Actions workflow commands — one annotation per finding. High →
+/// `::error`, Medium → `::warning`, Advisory → `::notice`. Exit codes are
+/// unchanged; the gate is still governed by `--deny`.
+fn emit_github(report: &ScanReport) {
+    for l in &report.leaks {
+        let cmd = match l.confidence {
+            Confidence::High => "error",
+            Confidence::Medium => "warning",
+            Confidence::Advisory => "notice",
+        };
+        let desc = rule_by_id(l.rule_id).map(|r| r.description).unwrap_or(l.rule_id);
+        let file = gh_escape_prop(&l.file);
+        let title = gh_escape_prop(l.rule_id);
+        let message = gh_escape_data(&format!("{desc}: {}", l.snippet));
+        println!(
+            "::{cmd} file={file},line={},col={},title={title}::{message}",
+            l.line, l.col
+        );
     }
 }
 
