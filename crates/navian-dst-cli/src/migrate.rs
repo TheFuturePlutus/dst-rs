@@ -17,7 +17,12 @@
 //! 3. The leak call sites are rewritten:
 //!    - `Instant::now()`               → `self.time.instant_now()`
 //!    - `tokio::time::sleep(d).await`  → `self.time.sleep(d).await`
-//!    - `SystemTime::now()…as_millis()`→ `self.time.now_ms()`
+//!    - `SystemTime::now()…as_millis() as T` → `self.time.now_ms() as T`
+//!      (the caller's trailing primitive-integer cast `T` is preserved
+//!      verbatim so the rewritten expression keeps the original type; `now_ms()`
+//!      is already `i64`). A bare `…as_millis()` (type `u128`, no cast) becomes
+//!      `self.time.now_ms() as u128`; a trailing NON-integer cast (e.g.
+//!      `as f64`) has no clean seam and is left as a manual skip.
 //!
 //! Everything else — leaks in free functions, closures, trait-impl methods
 //! (fixed signatures), tuple/unit structs, `std::thread::sleep`, `chrono`,
@@ -226,7 +231,8 @@ pub fn plan_sources(sources: &[(PathBuf, String)]) -> MigrateResult {
             closure_depth: 0,
             consumed: Vec::new(),
             cast_guarded: Vec::new(),
-            unsafe_cast_guarded: Vec::new(),
+            noninteger_cast_guarded: Vec::new(),
+            postfix_guarded: Vec::new(),
             rewrites: Vec::new(),
             literals: Vec::new(),
             skips: Vec::new(),
@@ -855,14 +861,23 @@ struct TransformVisitor<'a> {
     /// match, so the inner `SystemTime::now()` call is not double-reported.
     consumed: Vec<(usize, usize)>,
     /// Byte ranges of `SystemTime::now()…as_millis()` chains that sit directly
-    /// under a SIGNED, `i64`-holding `as` cast (`as i64`/`as i128`), so rewriting
-    /// them to the `i64`-typed `now_ms()` is type-safe. Populated in
-    /// `visit_expr_cast` before the inner method call is visited.
+    /// under a primitive-INTEGER `as` cast (`as i64`/`as u64`/`as u128`/…). The
+    /// rewrite replaces only the `…as_millis()` chain with `now_ms()` and leaves
+    /// the trailing ` as T` verbatim, so the expression keeps the caller's exact
+    /// type. Populated in `visit_expr_cast` before the inner method call is visited.
     cast_guarded: Vec<(usize, usize)>,
-    /// Like `cast_guarded`, but for chains under an UNSIGNED/narrowing integer
-    /// cast (`as u64`/`as usize`/…). These are NOT rewritten — a negative
-    /// (pre-epoch) `now_ms()` would wrap — but they get a precise skip reason.
-    unsafe_cast_guarded: Vec<(usize, usize)>,
+    /// Like `cast_guarded`, but for chains under a NON-integer cast (e.g.
+    /// `as f64`). `now_ms()` is `i64` with no clean mapping to such a target, so
+    /// these are NOT rewritten — they get a precise skip reason instead.
+    noninteger_cast_guarded: Vec<(usize, usize)>,
+    /// Byte ranges of BARE `SystemTime::now()…as_millis()` chains (no trailing
+    /// cast) that sit in POSTFIX/receiver position — i.e. they are the receiver
+    /// of a method call, the base of a field access, an index base, or the
+    /// operand of `?`/`.await`. The bare rewrite appends ` as u128`, and a cast
+    /// cannot be directly followed by `.`/`?`/`[`, so such a chain must be
+    /// parenthesized (`(self.time.now_ms() as u128)`) to stay parseable.
+    /// Populated by the postfix-parent visitors BEFORE the inner chain is visited.
+    postfix_guarded: Vec<(usize, usize)>,
     rewrites: Vec<Rewrite>,
     literals: Vec<StructLiteral>,
     skips: Vec<Skip>,
@@ -944,10 +959,30 @@ impl TransformVisitor<'_> {
             .any(|(s, e)| start == *s && end == *e)
     }
 
-    fn is_unsafe_cast_guarded(&self, start: usize, end: usize) -> bool {
-        self.unsafe_cast_guarded
+    fn is_noninteger_cast_guarded(&self, start: usize, end: usize) -> bool {
+        self.noninteger_cast_guarded
             .iter()
             .any(|(s, e)| start == *s && end == *e)
+    }
+
+    fn is_postfix_guarded(&self, start: usize, end: usize) -> bool {
+        self.postfix_guarded
+            .iter()
+            .any(|(s, e)| start == *s && end == *e)
+    }
+
+    /// If `base` is DIRECTLY a bare `SystemTime::now()…as_millis()` chain (not
+    /// wrapped in parens — a paren already makes a trailing cast safe), mark its
+    /// span as sitting in postfix position, so the bare rewrite parenthesizes the
+    /// ` as u128` it appends. Called from every postfix-parent visitor BEFORE the
+    /// chain itself is visited.
+    fn mark_postfix_base(&mut self, base: &syn::Expr) {
+        if let syn::Expr::MethodCall(m) = base {
+            if m.method == "as_millis" && system_now_root(&m.receiver).is_some() {
+                let r = m.span().byte_range();
+                self.postfix_guarded.push((r.start, r.end));
+            }
+        }
     }
 
     /// Decide how to handle a *rewritable-shaped* time leak given the current
@@ -1045,30 +1080,17 @@ fn path_ty_ident(ty: &syn::Type) -> Option<String> {
     None
 }
 
-/// Whether `ty` is a primitive integer type (any signedness/width). Used only
-/// to distinguish "there IS an integer cast" from a non-int cast, so an unsafe
-/// unsigned cast gets a precise skip reason rather than the generic u128 one.
+/// Whether `ty` is a primitive integer type (any signedness/width). A trailing
+/// `…as_millis() as T` cast to such a `T` is rewritten by PRESERVING the cast
+/// verbatim (`self.time.now_ms() as T`), so the rewritten expression keeps the
+/// caller's exact type. A non-integer trailing cast (e.g. `as f64`) has no clean
+/// `now_ms()` seam and is skipped instead.
 fn is_int_cast_ty(ty: &syn::Type) -> bool {
     const INT_TYPES: &[&str] = &[
         "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
     ];
     path_ty_ident(ty)
         .map(|id| INT_TYPES.contains(&id.as_str()))
-        .unwrap_or(false)
-}
-
-/// Whether `self.time.now_ms() as <ty>` preserves the semantics of the original
-/// `…as_millis() as <ty>`. `now_ms()` returns **`i64`**, and a simulated clock
-/// can legitimately return a NEGATIVE (pre-epoch) value — where the original
-/// `duration_since(UNIX_EPOCH).unwrap()` would have *panicked*. Casting a
-/// negative `i64` to an unsigned target (`u64`/`u128`/`usize`) silently wraps to
-/// a huge value instead. So the only cast targets we rewrite are SIGNED types
-/// wide enough to hold all of `i64`: `i64` and `i128`. Everything else (unsigned
-/// or narrower) is skipped and reported.
-fn is_safe_now_ms_cast_ty(ty: &syn::Type) -> bool {
-    const SAFE_TYPES: &[&str] = &["i64", "i128"];
-    path_ty_ident(ty)
-        .map(|id| SAFE_TYPES.contains(&id.as_str()))
         .unwrap_or(false)
 }
 
@@ -1199,20 +1221,47 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
         visit::visit_expr_struct(self, node);
     }
 
+    fn visit_expr_field(&mut self, node: &'ast syn::ExprField) {
+        // `…as_millis().0` — field access is postfix; a bare `as u128` cast would
+        // be unparseable directly before `.`.
+        self.mark_postfix_base(&node.base);
+        visit::visit_expr_field(self, node);
+    }
+
+    fn visit_expr_index(&mut self, node: &'ast syn::ExprIndex) {
+        // `…as_millis()[i]` — indexing is postfix.
+        self.mark_postfix_base(&node.expr);
+        visit::visit_expr_index(self, node);
+    }
+
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        // `…as_millis()?` — the `?` operator is postfix.
+        self.mark_postfix_base(&node.expr);
+        visit::visit_expr_try(self, node);
+    }
+
+    fn visit_expr_await(&mut self, node: &'ast syn::ExprAwait) {
+        // `…as_millis().await` — `.await` is postfix.
+        self.mark_postfix_base(&node.base);
+        visit::visit_expr_await(self, node);
+    }
+
     fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
-        // A `SystemTime::now()…as_millis() as <int>` cast is only type- AND
-        // semantics-safe to rewrite when the target is a SIGNED type that holds
-        // all of `i64` (`as i64`/`as i128`) — `now_ms()` is i64 and may be
-        // negative pre-epoch. An unsigned/narrowing integer cast is recorded
-        // separately so the method-call visit can emit a precise skip. Mark the
-        // chain's span BEFORE recursing so the inner method-call visit sees it.
+        // A `SystemTime::now()…as_millis() as T` cast is rewritten by PRESERVING
+        // the trailing cast: only the `…as_millis()` chain becomes `now_ms()`,
+        // and ` as T` is left verbatim, so the expression keeps the caller's
+        // exact type (`i64`/`u64`/`u128`/`usize`/…). That is type-preserving for
+        // ANY primitive-integer `T`. A NON-integer cast (e.g. `as f64`) has no
+        // clean `now_ms()` seam and is recorded separately so the method-call
+        // visit can emit a precise skip. Mark the chain's span BEFORE recursing
+        // so the inner method-call visit sees it.
         if let Some(m) = as_millis_chain(&node.expr) {
             if system_now_root(&m.receiver).is_some() {
                 let r = m.span().byte_range();
-                if is_safe_now_ms_cast_ty(&node.ty) {
+                if is_int_cast_ty(&node.ty) {
                     self.cast_guarded.push((r.start, r.end));
-                } else if is_int_cast_ty(&node.ty) {
-                    self.unsafe_cast_guarded.push((r.start, r.end));
+                } else {
+                    self.noninteger_cast_guarded.push((r.start, r.end));
                 }
             }
         }
@@ -1220,6 +1269,11 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        // If THIS call's receiver is a bare millis chain (`…as_millis().foo()`),
+        // that chain is in postfix position: mark it so its bare rewrite gets
+        // parenthesized (a cast cannot be directly followed by a method call).
+        self.mark_postfix_base(&node.receiver);
+
         // SystemTime::now()…as_millis()  →  self.time.now_ms()
         if node.method == "as_millis" {
             if let Some(now_span) = system_now_root(&node.receiver) {
@@ -1228,27 +1282,70 @@ impl<'ast> Visit<'ast> for TransformVisitor<'_> {
                 // Mark the inner now() call consumed so it isn't reported as a
                 // bare leak when we recurse into it.
                 self.consumed.push((nr.start, nr.end));
-                if !self.is_cast_guarded(whole.start, whole.end) {
-                    let reason = if self.is_unsafe_cast_guarded(whole.start, whole.end) {
-                        // There IS an integer cast, but it is unsigned/narrowing:
-                        // `now_ms()` is i64 and may be negative pre-epoch, which
-                        // would silently WRAP under `as u64` (vs the original
-                        // `.unwrap()` which panics). Refuse to rewrite.
-                        "SystemTime millis idiom under an unsigned/narrowing integer cast (e.g. `as u64`) — now_ms() is i64 and a pre-epoch value would wrap, unlike the original `.unwrap()` — map manually"
-                    } else {
-                        // No integer `as` cast around the chain: `now_ms()` returns
-                        // i64 but `as_millis()` is u128, so a blind rewrite could
-                        // change the expression's type and fail to compile.
-                        "SystemTime millis idiom without a signed integer (`as i64`) cast — rewriting to now_ms() would change u128→i64 — map manually"
-                    };
-                    self.push_skip(whole.start, whole.end, reason);
+                if self.is_cast_guarded(whole.start, whole.end) {
+                    // Trailing primitive-integer cast `as T`: rewrite ONLY the
+                    // `…as_millis()` chain to `now_ms()` and leave ` as T`
+                    // verbatim, so the rewritten expression keeps the caller's
+                    // exact type. `now_ms()` is i64; re-applying the original
+                    // cast reproduces the original width/signedness — type-
+                    // preserving by construction (for any integer `T`). The
+                    // source already parenthesized any receiver-position cast, so
+                    // preserving `as T` verbatim stays parseable (unlike the bare
+                    // form below, which must add its own parens there).
+                    //
+                    // Type-preserving but NOT panic-preserving for a pre-epoch
+                    // clock: the original `.unwrap()` panics before the epoch,
+                    // whereas an unsigned `as T` (e.g. `as u64`) wraps a negative
+                    // `now_ms()`. Benign for the production clock (≥ 0); only a
+                    // pre-epoch `SimulatedTime` differs.
+                    if let Some(target) = self.resolve_rewrite_target(whole.start, whole.end) {
+                        let impl_brace_open_end = self.cur_impl_brace_open_end();
+                        self.rewrites.push(Rewrite {
+                            struct_name: target,
+                            start: whole.start,
+                            end: whole.end,
+                            replacement: "self.time.now_ms()".to_string(),
+                            impl_brace_open_end,
+                        });
+                    }
+                } else if self.is_noninteger_cast_guarded(whole.start, whole.end) {
+                    // There IS a trailing cast, but it is NOT a primitive integer
+                    // (e.g. `as f64`): `now_ms()` is i64 with no clean mapping to
+                    // that target, so refuse to rewrite and report it.
+                    self.push_skip(
+                        whole.start,
+                        whole.end,
+                        "SystemTime millis idiom under a non-integer cast (e.g. `as f64`) — now_ms() is i64 with no clean mapping to that target — map manually",
+                    );
                 } else if let Some(target) = self.resolve_rewrite_target(whole.start, whole.end) {
+                    // Bare `…as_millis()` with NO trailing cast: the expression is
+                    // `u128`. `now_ms()` is i64, so append ` as u128` to keep the
+                    // expression `u128` and the surrounding code type-checking.
+                    //
+                    // In POSTFIX/receiver position (`…as_millis().to_string()`,
+                    // `…as_millis()?`, `…as_millis()[i]`) a bare cast is a PARSE
+                    // error — `now_ms() as u128.to_string()` — so parenthesize the
+                    // cast there. Elsewhere emit the bare cast so we don't add
+                    // redundant parens (which a `#![deny(unused_parens)]` crate
+                    // would reject, tripping the whole-run rollback).
+                    //
+                    // NOTE: type-preserving, but NOT panic-preserving for a
+                    // pre-epoch clock — the original
+                    // `…duration_since(UNIX_EPOCH).unwrap()` panics before the
+                    // epoch, whereas `now_ms() as u128` wraps a negative `now_ms()`
+                    // to a huge value. Benign for the injected production clock
+                    // (always ≥ 0); only a pre-epoch `SimulatedTime` differs.
                     let impl_brace_open_end = self.cur_impl_brace_open_end();
+                    let replacement = if self.is_postfix_guarded(whole.start, whole.end) {
+                        "(self.time.now_ms() as u128)".to_string()
+                    } else {
+                        "self.time.now_ms() as u128".to_string()
+                    };
                     self.rewrites.push(Rewrite {
                         struct_name: target,
                         start: whole.start,
                         end: whole.end,
-                        replacement: "self.time.now_ms()".to_string(),
+                        replacement,
                         impl_brace_open_end,
                     });
                 }
@@ -2035,9 +2132,9 @@ impl S {{
     }
 
     #[test]
-    fn systemtime_millis_without_int_cast_is_skipped() {
-        // `as_millis()` is u128; `now_ms()` is i64. Without an integer cast the
-        // rewrite would change the expression's type → skip + report.
+    fn systemtime_millis_bare_is_rewritten_as_u128() {
+        // Bare `…as_millis()` is `u128`; `now_ms()` is i64. The rewrite appends
+        // ` as u128` so the expression stays `u128` and still type-checks.
         let src = r#"
 struct Foo { x: u8 }
 impl Foo {
@@ -2047,24 +2144,91 @@ impl Foo {
     }
 }
 "#;
-        let r = plan(src);
+        let out = modified(src);
         assert!(
-            r.changes.is_empty(),
-            "u128 millis (no int cast) must not be rewritten"
+            out.contains("self.time.now_ms() as u128"),
+            "bare as_millis() must be rewritten to now_ms() as u128:\n{out}"
         );
-        assert_eq!(r.skips.len(), 1);
+        // TERMINAL position: no redundant parens (a `#![deny(unused_parens)]`
+        // crate would reject them and trip the whole-run rollback).
         assert!(
-            r.skips[0].reason.contains("u128") || r.skips[0].reason.contains("cast"),
-            "reason: {}",
-            r.skips[0].reason
+            !out.contains("(self.time.now_ms() as u128)"),
+            "terminal bare form must NOT be parenthesized:\n{out}"
+        );
+        assert!(!out.contains("SystemTime::now"), "stale call:\n{out}");
+        let r = plan(src);
+        assert_eq!(r.leaks_rewritten, 1);
+        assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
+        // Feeding the rewritten output back in must be a no-op (idempotency):
+        // `now_ms() as u128` is neither an `as_millis()` chain nor a SystemTime
+        // call, so it is inert on a second pass.
+        assert_eq!(modified(&out), out, "bare-form rewrite is not idempotent");
+    }
+
+    #[test]
+    fn systemtime_millis_bare_in_receiver_position_is_parenthesized() {
+        // MAJOR regression guard: a bare `…as_millis()` used as a method-call
+        // RECEIVER must be rewritten to `(self.time.now_ms() as u128).method()` —
+        // a bare `now_ms() as u128.to_string()` is a hard PARSE error.
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn stamp(&self) -> String {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string()
+    }
+}
+"#;
+        let out = modified(src);
+        assert!(
+            out.contains("(self.time.now_ms() as u128).to_string()"),
+            "receiver-position bare millis must be parenthesized:\n{out}"
+        );
+        assert!(!out.contains("SystemTime::now"), "stale call:\n{out}");
+        // The rewritten expression must PARSE (proves it isn't the broken
+        // `now_ms() as u128.to_string()` form).
+        assert!(
+            syn::parse_file(&out).is_ok(),
+            "rewritten source must still parse:\n{out}"
+        );
+        let r = plan(src);
+        assert_eq!(r.leaks_rewritten, 1);
+        assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
+        // Idempotent: the inner `now_ms()` is not an as_millis chain.
+        assert_eq!(modified(&out), out, "receiver-form rewrite is not idempotent");
+    }
+
+    #[test]
+    fn systemtime_millis_bare_via_try_operator_is_parenthesized() {
+        // `…as_millis()?` — the `?` operator is postfix too, so the bare cast
+        // must be parenthesized to parse (`now_ms() as u128?` is unparseable).
+        // (Parse-level check: the planner never type-checks, and the compile gate
+        // would back it up on real code.)
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn stamp(&self) -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()?
+    }
+}
+"#;
+        let out = modified(src);
+        assert!(
+            out.contains("(self.time.now_ms() as u128)?"),
+            "`?`-postfix bare millis must be parenthesized:\n{out}"
+        );
+        assert!(
+            syn::parse_file(&out).is_ok(),
+            "rewritten source must still parse:\n{out}"
         );
     }
 
     #[test]
-    fn systemtime_millis_with_u64_cast_is_skipped_not_rewritten() {
-        // `now_ms()` is i64 and can be negative pre-epoch; casting that to an
-        // unsigned `u64` would silently WRAP (the original `.unwrap()` panics).
-        // So an `as u64` cast must be SKIPPED + reported, not rewritten.
+    fn systemtime_millis_with_u64_cast_is_rewritten_preserving_cast() {
+        // `…as_millis() as u64` → `self.time.now_ms() as u64`: the caller's
+        // trailing integer cast is preserved verbatim, so the expression keeps
+        // its `u64` type. (The compile gate + rollback back this up.)
         let src = r#"
 struct Foo { x: u8 }
 impl Foo {
@@ -2074,15 +2238,60 @@ impl Foo {
     }
 }
 "#;
+        let out = modified(src);
+        assert!(
+            out.contains("self.time.now_ms() as u64"),
+            "`as u64` must be preserved verbatim:\n{out}"
+        );
+        assert!(!out.contains("SystemTime::now"), "stale call:\n{out}");
+        let r = plan(src);
+        assert_eq!(r.leaks_rewritten, 1);
+        assert!(r.skips.is_empty(), "unexpected skips: {:?}", r.skips);
+    }
+
+    #[test]
+    fn systemtime_millis_with_u128_cast_is_rewritten_preserving_cast() {
+        // `…as_millis() as u128` → `self.time.now_ms() as u128` (cast preserved).
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn now(&self) -> u128 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u128
+    }
+}
+"#;
+        let out = modified(src);
+        assert!(
+            out.contains("self.time.now_ms() as u128"),
+            "`as u128` must be preserved verbatim:\n{out}"
+        );
+        assert!(!out.contains("SystemTime::now"), "stale call:\n{out}");
+    }
+
+    #[test]
+    fn systemtime_millis_with_noninteger_cast_is_skipped() {
+        // `…as_millis() as f64` is NOT a primitive-integer cast; `now_ms()` is
+        // i64 with no clean mapping to a float target, so it must be SKIPPED +
+        // reported, never rewritten (honest — no invented transform).
+        let src = r#"
+struct Foo { x: u8 }
+impl Foo {
+    fn new() -> Self { Self { x: 0 } }
+    fn now(&self) -> f64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as f64
+    }
+}
+"#;
         let r = plan(src);
         assert!(
             r.changes.is_empty(),
-            "unsigned `as u64` cast must not be rewritten"
+            "non-integer `as f64` cast must not be rewritten"
         );
         assert!(r.structs_migrated.is_empty());
         assert_eq!(r.skips.len(), 1);
         assert!(
-            r.skips[0].reason.contains("unsigned"),
+            r.skips[0].reason.contains("non-integer"),
             "reason: {}",
             r.skips[0].reason
         );

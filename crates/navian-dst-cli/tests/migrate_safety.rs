@@ -534,3 +534,83 @@ fn check_doctests_gate_allows_a_passing_doctest() {
         "the leak must have been rewritten (change applied):\n{migrated}"
     );
 }
+
+// ── Generalized `as_millis()` trailing-cast forms compile end-to-end ──────────
+//
+// migrate preserves the caller's trailing integer cast so the rewritten
+// expression keeps its type (`… as u64` → `now_ms() as u64`), adds `as u128` to
+// a bare `…as_millis()`, and keeps the existing `as i64` optimization. This
+// proves ALL of those forms rewrite AND the result actually compiles under the
+// internal `cargo check --all-targets` gate (not just the in-memory planner).
+
+/// Every rewritable `as_millis()` trailing form in one migratable struct — each
+/// in its own `&self` method returning the matching type, so the crate only
+/// compiles if every rewrite is type-preserving.
+const MILLIS_FORMS_LIB: &str = "use std::time::{SystemTime, UNIX_EPOCH};\n\
+     pub struct Clock { n: u64 }\n\
+     impl Clock {\n\
+     \x20   pub fn new() -> Self { Self { n: 0 } }\n\
+     \x20   pub fn n(&self) -> u64 { self.n }\n\
+     \x20   pub fn bare(&self) -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() }\n\
+     \x20   pub fn as_u64(&self) -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }\n\
+     \x20   pub fn as_u128(&self) -> u128 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u128 }\n\
+     \x20   pub fn as_i64(&self) -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64 }\n\
+     \x20   pub fn as_string(&self) -> String { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis().to_string() }\n\
+     }\n";
+
+#[test]
+fn generalized_millis_cast_forms_rewrite_and_compile() {
+    let scratch = Scratch::new("millisforms");
+    let target = scratch.root.join("target");
+    let (_app, src) = write_dep_crate(&scratch, "millisforms", MILLIS_FORMS_LIB);
+    let lib_rs = src.join("lib.rs");
+
+    let (ok, out) = run_migrate(&src, &target, &[]);
+    assert!(ok, "migrate must succeed and compile the result:\n{out}");
+    // The internal `cargo check --all-targets` gate must PASS — the type-
+    // preserving rewrites keep every method's return type valid.
+    assert!(
+        out.contains("cargo check: PASSED"),
+        "all generalized cast forms must compile after rewrite:\n{out}"
+    );
+    assert!(
+        out.contains("structs migrated : 1") && out.contains("Clock"),
+        "Clock must be migrated:\n{out}"
+    );
+    assert!(
+        out.contains("leaks rewritten  : 5"),
+        "all five as_millis() forms must be rewritten:\n{out}"
+    );
+
+    let migrated = std::fs::read_to_string(&lib_rs).unwrap();
+    // Bare (terminal) gains a bare `as u128` (no redundant parens); each explicit
+    // cast is preserved verbatim.
+    assert!(
+        migrated.contains("pub fn bare(&self) -> u128 { self.time.now_ms() as u128 }"),
+        "bare terminal as_millis() must become now_ms() as u128 (no parens):\n{migrated}"
+    );
+    assert!(
+        migrated.contains("pub fn as_u64(&self) -> u64 { self.time.now_ms() as u64 }"),
+        "`as u64` must be preserved:\n{migrated}"
+    );
+    assert!(
+        migrated.contains("pub fn as_u128(&self) -> u128 { self.time.now_ms() as u128 }"),
+        "`as u128` must be preserved:\n{migrated}"
+    );
+    assert!(
+        migrated.contains("pub fn as_i64(&self) -> i64 { self.time.now_ms() as i64 }"),
+        "`as i64` must be preserved (existing behavior):\n{migrated}"
+    );
+    // RECEIVER position: the bare `as u128` MUST be parenthesized so it stays
+    // parseable before `.to_string()`. `cargo check: PASSED` above already proves
+    // the whole crate compiles — i.e. this did NOT emit `now_ms() as u128.to_string()`.
+    assert!(
+        migrated
+            .contains("pub fn as_string(&self) -> String { (self.time.now_ms() as u128).to_string() }"),
+        "receiver-position bare millis must become (now_ms() as u128).to_string():\n{migrated}"
+    );
+    assert!(
+        !migrated.contains("SystemTime::now"),
+        "no stale SystemTime::now call may remain:\n{migrated}"
+    );
+}
