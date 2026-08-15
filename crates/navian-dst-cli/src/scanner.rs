@@ -232,6 +232,332 @@ pub fn rule_by_id(id: &str) -> Option<&'static Rule> {
     rules::CATALOG.iter().copied().find(|r| r.id == id)
 }
 
+// ── Fix recipes: the "hand it to your AI agent" remediation content ──────────
+
+/// Curated, per-rule remediation content: WHY a source is nondeterministic, the
+/// injectable seam to route it through, whether `navian-dst migrate` can rewrite
+/// it today, and a BEFORE → AFTER snippet.
+///
+/// This is the machine-readable worklist that turns a bare finding into an
+/// actionable fix. Seam guidance is deliberately honest: it names a real
+/// `navian_dst::…` seam when one exists (the [`Time`](crate) / `Random` /
+/// `Executor` / `Network` traits) and otherwise gives the general approach —
+/// never a seam that does not exist.
+///
+/// [`fix_by_id`] returns one of these for every rule in [`rules::CATALOG`]
+/// (a completeness invariant enforced by tests). Fields are `&'static str` so a
+/// `RuleFix` is `Copy` and free to pass around.
+#[derive(Debug, Clone, Copy)]
+pub struct RuleFix {
+    /// 1–2 sentences on why the source breaks deterministic replay.
+    pub why: &'static str,
+    /// The injectable seam to route this through — a real `navian_dst::…` seam
+    /// when one exists, else the general approach (inject a trait / thread a
+    /// seeded value). Never claims a seam that does not exist.
+    pub suggested_seam: &'static str,
+    /// Whether `navian-dst migrate` can auto-rewrite this rule TODAY. True only
+    /// for the time family the codemod actually handles (`SystemTime::now`,
+    /// `Instant::now`); every other rule is a manual/agent fix.
+    pub autofixable: bool,
+    /// A concise "before" snippet showing the leak.
+    pub before: &'static str,
+    /// A concise "after" snippet showing the seam-routed rewrite.
+    pub after: &'static str,
+}
+
+// Shared seam descriptions, reused across the rules in a family so the guidance
+// stays consistent.
+const SEAM_TIME: &str = "navian_dst::Time — inject an `Arc<dyn navian_dst::Time>` \
+field (real `ProductionTime`, test `SimulatedTime`); read the clock via \
+`now_ms()` / `instant_now()` and sleep via the async `sleep()`.";
+const SEAM_RANDOM: &str = "navian_dst::Random — inject an `Arc<dyn navian_dst::Random>` \
+field (real `ProductionRandom`, test `SimulatedRandom::from_seed`); draw values \
+via `next_u64()` and ids via `next_uuid()`.";
+const SEAM_EXECUTOR: &str = "navian_dst::Executor — inject `ProductionExecutor` in \
+production and `SimulatedExecutor` in tests, and drive the workload on \
+`navian_dst::SimScheduler` (one task at a time) for reproducible scheduling order.";
+const SEAM_RAYON: &str = "No dedicated navian-dst seam — determinism here is about \
+ORDER, not a runtime handle. Make the reduction order-independent (collect then \
+sort, or a commutative+associative reduce), or run the parallel section serially \
+under `navian_dst::SimScheduler` in tests.";
+const SEAM_NETWORK_EXTERNAL: &str = "No general HTTP/socket-client seam exists in \
+navian-dst. For calls to EXTERNAL services, define your own client trait and \
+inject a fake in tests. `navian_dst::Network` (`SimulatedNetwork` + \
+`FaultSchedule`) models only cluster-internal node-to-node delivery, not an \
+outbound client.";
+const SEAM_NETWORK_INTERNAL: &str = "For cluster-internal node-to-node messaging, \
+route through `navian_dst::Network` (`ProductionNetwork` / `SimulatedNetwork` + a \
+seeded `FaultSchedule`). For traffic to EXTERNAL services there is no navian-dst \
+seam — inject your own transport/client trait and fake it in tests.";
+const SEAM_ENV: &str = "No navian-dst seam — ambient process input is not a runtime \
+source navian-dst models. Capture it ONCE at startup and thread it in as an \
+explicit parameter / config struct, so tests pass a fixed value instead of \
+reading the live environment.";
+const SEAM_FS_ORDER: &str = "No navian-dst seam. Directory/glob order is \
+OS-defined: collect the entries into a `Vec`, SORT them, then iterate — and, \
+where practical, hide the listing behind a trait you can fake in tests.";
+const SEAM_FS_TEMP: &str = "No dedicated seam for temp paths. Derive the name \
+deterministically from an injected, seeded `navian_dst::Random` instead of OS \
+entropy, or point tests at a fixed directory.";
+const SEAM_ITER: &str = "No runtime seam — this is a data-structure choice. Swap \
+`HashMap`/`HashSet` for `BTreeMap`/`BTreeSet` (sorted order) or \
+`IndexMap`/`IndexSet` (insertion order) wherever the iteration order is observed.";
+const SEAM_ATOMIC: &str = "No navian-dst seam. `Relaxed` lets threads observe \
+writes in an unpredictable order; use a stronger ordering (`Acquire`/`Release`/\
+`SeqCst`) where the order is observed, or drive the concurrent section \
+single-threaded under `navian_dst::SimScheduler` in tests.";
+
+/// Look up the curated [`RuleFix`] for a rule id. Returns `Some` for every rule
+/// in [`rules::CATALOG`] (enforced by the `every_rule_has_fix_content` test).
+pub fn fix_by_id(id: &str) -> Option<RuleFix> {
+    use rules as r;
+    let fix = match id {
+        // ── Time ──
+        _ if id == r::TIME_SYSTEMTIME_NOW.id => RuleFix {
+            why: "Reads the host wall clock, so the same code returns a different \
+value on every run — replays diverge immediately.",
+            suggested_seam: SEAM_TIME,
+            autofixable: true,
+            before: "let ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;",
+            after: "let ms = self.time.now_ms(); // Arc<dyn navian_dst::Time>",
+        },
+        _ if id == r::TIME_INSTANT_NOW.id => RuleFix {
+            why: "The monotonic clock advances with real wall-clock elapsed time, \
+so measured durations differ run-to-run and cannot be replayed.",
+            suggested_seam: SEAM_TIME,
+            autofixable: true,
+            before: "let t0 = Instant::now();",
+            after: "let t0 = self.time.instant_now(); // Arc<dyn navian_dst::Time>",
+        },
+        _ if id == r::TIME_CHRONO_NOW.id => RuleFix {
+            why: "`chrono::Utc::now()`/`Local::now()` read the host wall clock; the \
+value changes every run and, for `Local`, also depends on the machine timezone.",
+            suggested_seam: SEAM_TIME,
+            autofixable: false,
+            before: "let now = chrono::Utc::now();",
+            after: "let now = chrono::DateTime::from_timestamp_millis(self.time.now_ms()).unwrap();",
+        },
+        _ if id == r::TIME_OFFSETDATETIME_NOW.id => RuleFix {
+            why: "`time::OffsetDateTime::now_utc()` reads the host wall clock, so \
+each run observes a different instant.",
+            suggested_seam: SEAM_TIME,
+            autofixable: false,
+            before: "let now = OffsetDateTime::now_utc();",
+            after: "let now = OffsetDateTime::from_unix_timestamp_nanos((self.time.now_ms() as i128) * 1_000_000)?;",
+        },
+        _ if id == r::TIME_TOKIO_INSTANT_NOW.id => RuleFix {
+            why: "The tokio runtime clock still tracks real elapsed time outside a \
+paused test runtime, so durations vary run-to-run.",
+            suggested_seam: SEAM_TIME,
+            autofixable: false,
+            before: "let t0 = tokio::time::Instant::now();",
+            after: "let t0 = self.time.instant_now(); // Arc<dyn navian_dst::Time>",
+        },
+        _ if id == r::TIME_THREAD_SLEEP.id => RuleFix {
+            why: "A real OS sleep blocks the thread for a wall-clock duration; the \
+exact timing interleaves nondeterministically with the rest of the system.",
+            suggested_seam: SEAM_TIME,
+            autofixable: false,
+            before: "std::thread::sleep(Duration::from_millis(50));",
+            after: "self.time.sleep(Duration::from_millis(50)).await; // harness clock, no real wait",
+        },
+        _ if id == r::TIME_TOKIO_TIMER.id => RuleFix {
+            why: "tokio `sleep`/`interval`/`timeout` fire on real elapsed time \
+(outside a paused runtime), so timer-driven ordering is not reproducible.",
+            suggested_seam: SEAM_TIME,
+            autofixable: false,
+            before: "tokio::time::sleep(Duration::from_millis(50)).await;",
+            after: "self.time.sleep(Duration::from_millis(50)).await; // for timeouts: navian_dst::timeout(&*self.time, dur, fut).await",
+        },
+        // ── Random ──
+        _ if id == r::RAND_THREAD_RNG.id => RuleFix {
+            why: "`thread_rng()` is seeded from OS entropy, so every run draws a \
+different sequence and replays cannot match.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let n: u64 = rand::thread_rng().gen();",
+            after: "let n = self.rng.next_u64(); // Arc<dyn navian_dst::Random>",
+        },
+        _ if id == r::RAND_RANDOM.id => RuleFix {
+            why: "`rand::random()` pulls from the OS-seeded thread RNG, producing a \
+fresh value on every run.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let n: u64 = rand::random();",
+            after: "let n = self.rng.next_u64(); // Arc<dyn navian_dst::Random>",
+        },
+        _ if id == r::RAND_OSRNG.id => RuleFix {
+            why: "`OsRng` reads OS entropy directly — the ultimate nondeterministic \
+source; nothing about its output is reproducible.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let mut rng = OsRng;",
+            after: "// draw from the injected seam instead: let n = self.rng.next_u64();",
+        },
+        _ if id == r::RAND_FROM_ENTROPY.id => RuleFix {
+            why: "`from_entropy()` seeds a PRNG from OS entropy, so the whole \
+downstream sequence differs on every run.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let mut rng = SmallRng::from_entropy();",
+            after: "let mut rng = SmallRng::seed_from_u64(self.rng.next_u64()); // seed from the injected navian_dst::Random",
+        },
+        _ if id == r::RAND_GETRANDOM.id => RuleFix {
+            why: "`getrandom` fills the buffer straight from OS entropy — raw, \
+irreproducible randomness.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let mut buf = [0u8; 16]; getrandom::getrandom(&mut buf)?;",
+            after: "for chunk in buf.chunks_mut(8) { chunk.copy_from_slice(&self.rng.next_u64().to_le_bytes()[..chunk.len()]); }",
+        },
+        _ if id == r::RAND_UUID.id => RuleFix {
+            why: "`Uuid::new_v4()`/`now_v7()` embed OS randomness (and wall-clock \
+time for v7), so identifiers differ on every run.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let id = Uuid::new_v4();",
+            after: "let id = self.rng.next_uuid(); // deterministic v4-shape from the seed",
+        },
+        _ if id == r::RAND_FASTRAND.id => RuleFix {
+            why: "`fastrand`'s thread-local generator is seeded from the clock/OS, \
+so its stream is not reproducible across runs.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let n = fastrand::u64(..);",
+            after: "let n = self.rng.next_u64(); // Arc<dyn navian_dst::Random>",
+        },
+        _ if id == r::RAND_GEN_METHOD.id => RuleFix {
+            why: "A `.gen()`/`.gen_range()` call is only reproducible if the RNG it \
+is called on is seeded and injected; on a `thread_rng()` it is not.",
+            suggested_seam: SEAM_RANDOM,
+            autofixable: false,
+            before: "let n: u8 = rng.gen();",
+            after: "let n = self.rng.next_u64() as u8; // via injected navian_dst::Random",
+        },
+        // ── Network ──
+        _ if id == r::NET_STD.id => RuleFix {
+            why: "A real TCP/UDP socket depends on the network, a peer, and OS \
+scheduling — timing and failures vary every run and cannot be replayed.",
+            suggested_seam: SEAM_NETWORK_INTERNAL,
+            autofixable: false,
+            before: "let stream = TcpStream::connect(\"10.0.0.1:9000\")?;",
+            after: "// external I/O: inject a transport trait and fake it in tests; for internal node comms use navian_dst::SimulatedNetwork",
+        },
+        _ if id == r::NET_REQWEST.id => RuleFix {
+            why: "An HTTP call reaches a live remote service, so the response, \
+latency, and error behavior differ on every run.",
+            suggested_seam: SEAM_NETWORK_EXTERNAL,
+            autofixable: false,
+            before: "let body = reqwest::get(url).await?.text().await?;",
+            after: "let body = self.http.get(url).await?; // inject your own HttpClient trait; fake it in tests",
+        },
+        _ if id == r::NET_TOKIO.id => RuleFix {
+            why: "An async socket depends on the network, the peer, and runtime \
+scheduling — none of which are reproducible across runs.",
+            suggested_seam: SEAM_NETWORK_INTERNAL,
+            autofixable: false,
+            before: "let stream = tokio::net::TcpStream::connect(addr).await?;",
+            after: "// inject a transport trait; navian_dst::SimulatedNetwork models internal delivery + seeded faults",
+        },
+        // ── Concurrency ──
+        _ if id == r::CONC_THREAD_SPAWN.id => RuleFix {
+            why: "An OS thread is scheduled by the kernel, so the interleaving of \
+its work with the rest of the program varies run-to-run.",
+            suggested_seam: SEAM_EXECUTOR,
+            autofixable: false,
+            before: "let h = std::thread::spawn(|| work());",
+            after: "let h = self.exec.spawn(async { work() }); // navian_dst::Executor; drive under SimScheduler in tests",
+        },
+        _ if id == r::CONC_TOKIO_SPAWN.id => RuleFix {
+            why: "A detached tokio task runs in whatever order the multi-threaded \
+runtime schedules it, so observable ordering is not reproducible.",
+            suggested_seam: SEAM_EXECUTOR,
+            autofixable: false,
+            before: "tokio::spawn(async move { work().await });",
+            after: "self.exec.spawn(async move { work().await }); // ProductionExecutor in prod, SimulatedExecutor + SimScheduler in tests",
+        },
+        _ if id == r::CONC_RAYON.id => RuleFix {
+            why: "Parallel iteration splits work across a thread pool, so reduction \
+order (and any order-sensitive side effect) varies between runs.",
+            suggested_seam: SEAM_RAYON,
+            autofixable: false,
+            before: "let total: u64 = v.par_iter().map(cost).sum();",
+            after: "let total: u64 = v.iter().map(cost).sum(); // fixed order; or reduce commutatively",
+        },
+        // ── Iteration ──
+        _ if id == r::ITER_HASH.id => RuleFix {
+            why: "`HashMap`/`HashSet` iteration order is randomized per process \
+(and unspecified), so anything that observes the order diverges across runs.",
+            suggested_seam: SEAM_ITER,
+            autofixable: false,
+            before: "for (k, v) in &map { /* HashMap: order varies */ }",
+            after: "for (k, v) in &btree_map { /* BTreeMap: sorted, stable */ }",
+        },
+        // ── Env / Process ──
+        _ if id == r::ENV_VAR.id => RuleFix {
+            why: "Environment variables and args are ambient process input; a \
+different shell or CI runner yields different values, so the run is not \
+reproducible from the code alone.",
+            suggested_seam: SEAM_ENV,
+            autofixable: false,
+            before: "let level = std::env::var(\"LOG_LEVEL\").unwrap_or_default();",
+            after: "let level = self.config.log_level.clone(); // captured once at startup, injected",
+        },
+        _ if id == r::ENV_PROCESS_ID.id => RuleFix {
+            why: "The PID is assigned by the OS at launch, so it differs on every \
+invocation and cannot appear in a byte-for-byte replay.",
+            suggested_seam: SEAM_ENV,
+            autofixable: false,
+            before: "let pid = std::process::id();",
+            after: "let pid = self.config.instance_id; // injected, stable per logical run",
+        },
+        _ if id == r::ENV_COMMAND.id => RuleFix {
+            why: "Spawning an external process yields output that depends on the \
+host, its installed tools, and timing — none reproducible from your code.",
+            suggested_seam: SEAM_ENV,
+            autofixable: false,
+            before: "let out = Command::new(\"git\").arg(\"rev-parse\").output()?;",
+            after: "let out = self.shell.run(\"git\", &[\"rev-parse\"])?; // inject a runner trait; fake it in tests",
+        },
+        // ── Filesystem ──
+        _ if id == r::FS_READ_DIR.id => RuleFix {
+            why: "`read_dir` returns entries in filesystem order, which varies by \
+OS and filesystem, so downstream processing order is nondeterministic.",
+            suggested_seam: SEAM_FS_ORDER,
+            autofixable: false,
+            before: "for e in std::fs::read_dir(dir)? { process(e?); }",
+            after: "let mut es: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_,_>>()?; es.sort_by_key(|e| e.path()); for e in es { process(e); }",
+        },
+        _ if id == r::FS_GLOB.id => RuleFix {
+            why: "`glob` yields matches in filesystem-dependent order, so any \
+order-sensitive use diverges across machines and runs.",
+            suggested_seam: SEAM_FS_ORDER,
+            autofixable: false,
+            before: "for p in glob::glob(\"*.rs\")? { use_path(p?); }",
+            after: "let mut ps: Vec<_> = glob::glob(\"*.rs\")?.collect::<Result<_,_>>()?; ps.sort(); for p in ps { use_path(p); }",
+        },
+        _ if id == r::FS_TEMPFILE.id => RuleFix {
+            why: "A temp file/dir gets a random OS-chosen path, so the path (and \
+anything derived from it) differs on every run.",
+            suggested_seam: SEAM_FS_TEMP,
+            autofixable: false,
+            before: "let dir = tempfile::tempdir()?; // random OS path",
+            after: "let name = format!(\"run-{:016x}\", self.rng.next_u64()); // seeded via navian_dst::Random",
+        },
+        // ── Atomics ──
+        _ if id == r::ATOMIC_RELAXED.id => RuleFix {
+            why: "`Ordering::Relaxed` places no cross-thread ordering constraint, \
+so the order in which other threads observe the write is not deterministic.",
+            suggested_seam: SEAM_ATOMIC,
+            autofixable: false,
+            before: "counter.store(1, Ordering::Relaxed);",
+            after: "counter.store(1, Ordering::SeqCst); // observable order; or drive single-threaded under SimScheduler",
+        },
+        _ => return None,
+    };
+    Some(fix)
+}
+
 /// The rule catalog — the single source of truth for
 /// `id → category → confidence → description`.
 pub mod rules {
@@ -1303,6 +1629,50 @@ mod tests {
         let before = ids.len();
         ids.dedup();
         assert_eq!(before, ids.len(), "duplicate rule id in CATALOG");
+    }
+
+    // ── Fix recipes: completeness + autofixable accuracy ──────────────────
+
+    #[test]
+    fn every_rule_has_fix_content() {
+        // No rule in the catalog may be left without an explain recipe: every id
+        // must resolve, and every field must be non-empty.
+        for rule in rules::CATALOG {
+            let fix = fix_by_id(rule.id)
+                .unwrap_or_else(|| panic!("no RuleFix content for {}", rule.id));
+            assert!(!fix.why.trim().is_empty(), "{} has empty `why`", rule.id);
+            assert!(
+                !fix.suggested_seam.trim().is_empty(),
+                "{} has empty `suggested_seam`",
+                rule.id
+            );
+            assert!(!fix.before.trim().is_empty(), "{} has empty `before`", rule.id);
+            assert!(!fix.after.trim().is_empty(), "{} has empty `after`", rule.id);
+        }
+    }
+
+    #[test]
+    fn autofixable_matches_the_migrate_time_family() {
+        // `autofixable` is TRUE only where migrate FULLY covers the rule: exactly
+        // two rules today — SystemTime::now (millis idiom) and Instant::now.
+        // DST-TIME-007's tokio::time::sleep case is only PARTIAL (migrate skips
+        // sleep_until/interval/timeout), so that rule stays false; every other
+        // rule must report false too, so we never over-promise the codemod.
+        let autofix: Vec<&str> = rules::CATALOG
+            .iter()
+            .filter(|r| fix_by_id(r.id).unwrap().autofixable)
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(autofix, vec!["DST-TIME-001", "DST-TIME-002"]);
+
+        // Spot-check a concurrency and an iteration rule are NOT autofixable.
+        assert!(!fix_by_id("DST-CONC-002").unwrap().autofixable);
+        assert!(!fix_by_id("DST-ITER-001").unwrap().autofixable);
+    }
+
+    #[test]
+    fn fix_by_id_unknown_is_none() {
+        assert!(fix_by_id("DST-NOPE-999").is_none());
     }
 
     // ── Fully-qualified forms → correct category ──────────────────────────

@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use baseline::Baseline;
 use migrate::{migrate_path, CheckOutcome, MigrateOptions, MigrateResult, TraitFamily};
-use scanner::{fingerprint, rule_by_id, scan_path, Category, Confidence, ScanReport};
+use scanner::{fingerprint, fix_by_id, rule_by_id, scan_path, Category, Confidence, ScanReport};
 
 /// Exit code for a tool/usage error (bad args, unreadable path).
 const EXIT_USAGE: u8 = 2;
@@ -143,6 +143,30 @@ enum Commands {
         /// Baseline file to write. Defaults to `navian-dst-baseline.json`.
         #[arg(long, default_value = "navian-dst-baseline.json")]
         out: PathBuf,
+    },
+
+    /// Explain a rule: why it is nondeterministic, the injectable seam to route
+    /// it through, a before → after snippet, and whether `migrate` auto-fixes it.
+    ///
+    /// This is the "hand it to your AI agent" recipe for a single finding. Run
+    /// `explain <RULE-ID>` for the full recipe, `explain --list` (or bare
+    /// `explain`) to list every rule, and add `--format json` for the structured
+    /// form an agent can consume.
+    Explain {
+        /// Rule id to explain (e.g. `DST-TIME-001`). Omit — or pass `--list` — to
+        /// list every rule id with its one-line description.
+        #[arg(value_name = "RULE-ID")]
+        rule_id: Option<String>,
+
+        /// List every rule id + one-line description instead of explaining one.
+        #[arg(long)]
+        list: bool,
+
+        /// Output format: `human` (default) or `json`. `json` emits the fix
+        /// recipe as a structured object for agents. (`sarif`/`github` are not
+        /// meaningful here and fall back to `human`.)
+        #[arg(long, value_enum, value_name = "human|json")]
+        format: Option<Format>,
     },
 
     /// Scaffold navian-dst adoption in the current repo (never overwrites).
@@ -338,6 +362,41 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Commands::Explain {
+            rule_id,
+            list,
+            format,
+        } => {
+            let as_json = matches!(format, Some(Format::Json));
+            // Bare `explain` or `explain --list` → list every rule.
+            match rule_id {
+                None => {
+                    emit_explain_list(as_json);
+                    ExitCode::SUCCESS
+                }
+                Some(_) if list => {
+                    // `--list` is a list request; a stray id alongside it is
+                    // ignored in favor of the list (no silent surprise).
+                    emit_explain_list(as_json);
+                    ExitCode::SUCCESS
+                }
+                Some(id) => match (rule_by_id(&id), fix_by_id(&id)) {
+                    (Some(rule), Some(fix)) => {
+                        emit_explain_one(rule, &fix, as_json);
+                        ExitCode::SUCCESS
+                    }
+                    // Unknown id (or, defensively, a catalog rule missing fix
+                    // content) → usage error with a pointer to `--list`.
+                    _ => {
+                        eprintln!(
+                            "error: unknown rule id `{id}`. Run `navian-dst explain --list` \
+                             to see every rule id."
+                        );
+                        ExitCode::from(EXIT_USAGE)
+                    }
+                },
+            }
+        }
         Commands::Init => init_scaffold(),
     }
 }
@@ -526,14 +585,153 @@ fn emit_migrate(result: &MigrateResult, dry_run: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// A short, actionable next step for a finding, keyed off whether `migrate` can
+/// rewrite it. Used as the `fix_hint` field in `scan --json`.
+fn fix_hint(rule_id: &str, autofixable: bool) -> String {
+    if autofixable {
+        format!("navian-dst migrate can rewrite this (run: navian-dst migrate); details: navian-dst explain {rule_id}")
+    } else {
+        format!("run: navian-dst explain {rule_id}")
+    }
+}
+
 fn emit_json(report: &ScanReport) {
-    // The `--json` contract is exactly the leak array. Each item is a stable
-    // object: {rule_id, confidence, category, file, line, col, function, snippet}.
-    match serde_json::to_string_pretty(&report.leaks) {
+    use serde_json::json;
+
+    // Back-compat: the top-level shape stays the stable leak ARRAY, and every
+    // item keeps its existing keys in place ({rule_id, confidence, category,
+    // file, line, col, function, snippet}). Each item gains three ADDITIVE
+    // agent-worklist keys: `suggested_seam`, `autofixable`, `fix_hint`. We do
+    // NOT wrap the array in a top-level object (that would break consumers that
+    // read the array directly), so no top-level `summary` is emitted here.
+    let enriched: Vec<serde_json::Value> = report
+        .leaks
+        .iter()
+        .map(|l| {
+            // `Leak` is a plain `#[derive(Serialize)]` of owned scalars/strings,
+            // so serialization is infallible; `expect` guards the stable contract
+            // (a finding must never silently lose its 8 keys).
+            let mut v = serde_json::to_value(l).expect("Leak serializes");
+            let (seam, autofixable) = match fix_by_id(l.rule_id) {
+                Some(f) => (f.suggested_seam.to_string(), f.autofixable),
+                // Defensive: every catalog rule has fix content (enforced by a
+                // test), so this branch is unreachable for real findings.
+                None => (String::new(), false),
+            };
+            if let serde_json::Value::Object(map) = &mut v {
+                map.insert("suggested_seam".into(), json!(seam));
+                map.insert("autofixable".into(), json!(autofixable));
+                map.insert("fix_hint".into(), json!(fix_hint(l.rule_id, autofixable)));
+            }
+            v
+        })
+        .collect();
+
+    match serde_json::to_string_pretty(&enriched) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("failed to serialize leaks: {e}"),
     }
 }
+
+/// List every rule id + one-line description, as human text or a JSON array.
+fn emit_explain_list(as_json: bool) {
+    use scanner::rules::CATALOG;
+
+    if as_json {
+        let arr: Vec<serde_json::Value> = CATALOG
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "rule_id": r.id,
+                    "category": r.category,
+                    "confidence": r.confidence,
+                    "description": r.description,
+                    "autofixable": fix_by_id(r.id).map(|f| f.autofixable).unwrap_or(false),
+                })
+            })
+            .collect();
+        match serde_json::to_string_pretty(&arr) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed to serialize rule list: {e}"),
+        }
+        return;
+    }
+
+    println!("Determinism rules ({}):\n", CATALOG.len());
+    for r in CATALOG {
+        println!(
+            "  {:<15} [{:<8}] {:<12} {}",
+            r.id,
+            r.confidence.label(),
+            r.category.label(),
+            r.description
+        );
+    }
+    println!("\nRun `navian-dst explain <RULE-ID>` for the full fix recipe.");
+}
+
+/// Explain one rule, as a human recipe or a structured JSON object.
+fn emit_explain_one(rule: &scanner::Rule, fix: &scanner::RuleFix, as_json: bool) {
+    if as_json {
+        // The documented agent schema:
+        // {rule_id, category, confidence, why, suggested_seam, autofixable, before, after}.
+        let doc = serde_json::json!({
+            "rule_id": rule.id,
+            "category": rule.category,
+            "confidence": rule.confidence,
+            "why": fix.why,
+            "suggested_seam": fix.suggested_seam,
+            "autofixable": fix.autofixable,
+            "before": fix.before,
+            "after": fix.after,
+        });
+        match serde_json::to_string_pretty(&doc) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("failed to serialize explain: {e}"),
+        }
+        return;
+    }
+
+    println!(
+        "{}  [{}]  {}",
+        rule.id,
+        rule.confidence.label(),
+        rule.category.label()
+    );
+    println!("{}\n", rule.description);
+
+    println!("Why it is nondeterministic:");
+    println!("  {}\n", fix.why);
+
+    println!("Injectable seam:");
+    println!("  {}\n", fix.suggested_seam);
+
+    println!("Before → after:");
+    println!("  - {}", fix.before);
+    println!("  + {}\n", fix.after);
+
+    if fix.autofixable {
+        println!("Auto-fixable: YES — `navian-dst migrate` can rewrite this. {MIGRATE_SCOPE}");
+    } else {
+        println!(
+            "Auto-fixable: NO — `navian-dst migrate` will not fully auto-rewrite this rule \
+             today. {MIGRATE_SCOPE} Apply the seam above by hand, or hand this recipe to your \
+             coding agent."
+        );
+    }
+}
+
+/// The accurate, generic description of what `navian-dst migrate` handles today.
+/// Reused everywhere migrate's scope is enumerated so no message over- or
+/// under-claims. migrate rewrites a *conservative subset* of the Time family —
+/// the `SystemTime::now()…as_millis()` idiom (→ `now_ms()`), `Instant::now()`
+/// (→ `instant_now()`), and `tokio::time::sleep()` (→ `Time::sleep()`) — inside
+/// inherent methods of named-field structs; it skips everything else (including
+/// `tokio::time::sleep_until`/`interval`/`timeout`).
+const MIGRATE_SCOPE: &str = "migrate handles a conservative subset of the Time \
+family — the SystemTime millis idiom, Instant::now, and tokio::time::sleep — \
+verifying each rewrite with `cargo check --all-targets` and rolling back anything \
+it can't safely change.";
 
 /// A short, human-readable SARIF rule `name` derived from the description: the
 /// text before the em-dash (`SystemTime::now`), else the whole description.
