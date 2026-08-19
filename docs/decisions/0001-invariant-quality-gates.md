@@ -42,9 +42,9 @@ determinism layer well. It does not yet touch invariant **quality**.
 ## Decision
 
 Add two invariant-quality features to `navian-dst-cli`, each matching the layer it
-belongs to. They ship in **separate commits**: (1) presence enforcement lands first
-(the `invariants` subcommand); (2) adversarial review follows as its own command.
-This ADR governs both; only feature 1 is realized at the time of writing.
+belongs to. They ship in **separate commits**: (1) presence enforcement (the
+`invariants` subcommand); (2) adversarial review (the `review` subcommand). Both are
+now realized.
 
 1. **Presence enforcement (hard CI gate).** A static check that fails when a file
    exercises the simulation surface (`SimScheduler`, `FaultSchedule`,
@@ -59,13 +59,19 @@ This ADR governs both; only feature 1 is realized at the time of writing.
    analysis cannot distinguish it from a legitimately-checked helper engine in the
    same file, and the cardinal rule forbids risking a false MISSING to catch it.
 
-2. **Adversarial invariant review (advisory only, never modifies code).** A
-   subcommand that extracts each declared `Invariant` (its `name` and predicate
-   source, via `syn`) and produces a critical review of the set — tautologies,
-   likely gaps, missing money-movement properties — using domain knowledge (LLM-
-   assisted when a key is present, static tautology heuristics always). It **votes,
-   it does not gate**: output is commentary a human weighs, consistent with the
-   project's LLM-zero-authority stance. It changes no source.
+2. **Adversarial invariant review (advisory only, never modifies code).** The
+   `review` subcommand extracts each declared `Invariant` (name + predicate source,
+   via `syn`, including inside `vec![...]`) and critiques the set. The critique has
+   two layers matching what a tool can vs. can't know: (a) **deterministic,
+   domain-agnostic static checks** — TAUTOLOGY (predicate can never be false),
+   IGNORES-STATE (predicate never reads its state param), DUPLICATE — always, with
+   no network or key; and (b) the **domain-specific** part ("which invariants are
+   you MISSING?") is emitted as an **adversarial prompt handed to the author's own
+   LLM/agent**, NOT computed by a hardcoded checklist — a domain-agnostic tool must
+   not bake in money-movement (or any vertical's) property list, and this also
+   avoids a networked, non-deterministic call inside a determinism tool. It **votes,
+   it does not gate** (always exits 0), consistent with the LLM-zero-authority
+   stance. It changes no source.
 
 The division of labor is explicit: **the CLI writes/enforces the mechanical parts;
 the human (or their agent) authors the domain invariants; the CLI then (1) enforces
@@ -138,8 +144,8 @@ future addition but is **not** required for v1; the waiver is the escape hatch.
 
 - Feature 1 (shipped): `crates/navian-dst-cli/src/presence.rs` (the analyzer) and
   the `Commands::Invariants` arm in `crates/navian-dst-cli/src/main.rs`.
-- Feature 2 (follow-up, not yet built): a `review` command + module for
-  `syn`-based invariant extraction + LLM critique.
+- Feature 2 (shipped): `crates/navian-dst-cli/src/review.rs` (extraction + static
+  weakness detectors + adversarial-prompt builder) and the `Commands::Review` arm.
 - Library seam: `crates/navian-dst/src/invariant.rs` (`InvariantEngine::is_empty`/
   `len` — the presence semantics the gate mirrors statically).
 - Tests: presence gate over fixtures (a vacuous sim → MISSING; an UNUSED empty

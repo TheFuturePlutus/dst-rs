@@ -12,6 +12,7 @@ mod baseline;
 mod check;
 mod migrate;
 mod presence;
+mod review;
 mod scanner;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use baseline::Baseline;
 use migrate::{migrate_path, CheckOutcome, MigrateOptions, MigrateResult, TraitFamily};
 use presence::{check_path, PresenceReport, Status};
+use review::{review_path, ReviewReport};
 use scanner::{fingerprint, fix_by_id, rule_by_id, scan_path, Category, Confidence, ScanReport};
 
 /// Exit code for a tool/usage error (bad args, unreadable path).
@@ -294,6 +296,36 @@ enum Commands {
         /// declared invariant). Implies `--deny`.
         #[arg(long)]
         deny_raw: bool,
+    },
+
+    /// Adversarially review the invariants that ARE present — the companion to
+    /// `invariants`, which only checks that they exist.
+    ///
+    /// For every `Invariant::new("name", |state| …)` it flags, deterministically and
+    /// offline, the ones that are structurally hollow:
+    ///   TAUTOLOGY      — the predicate can never be false (`|_| true`, `w.x == w.x`).
+    ///   IGNORES-STATE  — the predicate never reads the state it is handed.
+    ///   DUPLICATE      — same predicate as another invariant.
+    ///
+    /// It NEVER decides whether an invariant is *correct* — that is domain policy the
+    /// author owns. The domain-specific "which invariants are you MISSING?" critique
+    /// is emitted as an adversarial PROMPT you hand to your own LLM/agent (the domain
+    /// knowledge lives there, not in a domain-agnostic tool). This command votes; it
+    /// never gates and never rewrites your code — it always exits 0.
+    Review {
+        /// Directory (or file) to review. Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output format: `human` (default) or `json` (invariants + weaknesses, for
+        /// an agent). `sarif`/`github` are rejected (exit 2).
+        #[arg(long, value_enum, value_name = "human|json")]
+        format: Option<Format>,
+
+        /// Print ONLY the adversarial critique prompt (the block to hand your
+        /// LLM/agent), and nothing else. Useful for piping into a tool.
+        #[arg(long)]
+        prompt_only: bool,
     },
 }
 
@@ -579,6 +611,32 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::SUCCESS
             }
+        }
+        Commands::Review {
+            path,
+            format,
+            prompt_only,
+        } => {
+            if matches!(format, Some(Format::Sarif) | Some(Format::Github)) {
+                eprintln!("error: `review` supports only --format human|json");
+                return ExitCode::from(EXIT_USAGE);
+            }
+            if !path.exists() {
+                eprintln!("error: path does not exist: {}", path.display());
+                return ExitCode::from(EXIT_USAGE);
+            }
+            let report = review_path(&path);
+            if prompt_only {
+                println!("{}", review_prompt(&report));
+            } else {
+                match format {
+                    Some(Format::Json) => emit_review_json(&report),
+                    _ => emit_review_human(&report),
+                }
+            }
+            // Advisory: review votes, it never gates. Always exit 0 (usage errors
+            // above are the only non-zero paths).
+            ExitCode::SUCCESS
         }
     }
 }
@@ -869,6 +927,120 @@ fn emit_invariants_json(report: &PresenceReport) {
         Ok(s) => println!("{s}"),
         Err(e) => eprintln!("failed to serialize report: {e}"),
     }
+}
+
+/// Human report for `review`: the flagged invariants first, then the clean ones,
+/// then the adversarial prompt to hand an agent for the domain-specific critique.
+fn emit_review_human(report: &ReviewReport) {
+    println!("== Invariant review ==\n");
+
+    if report.invariants.is_empty() {
+        println!("No `Invariant::new(...)` calls found.\n");
+    }
+
+    let flagged: Vec<_> = report.invariants.iter().filter(|i| !i.weaknesses.is_empty()).collect();
+    let clean: Vec<_> = report.invariants.iter().filter(|i| i.weaknesses.is_empty()).collect();
+
+    if !flagged.is_empty() {
+        println!("Structurally weak ({}):", flagged.len());
+        for inv in &flagged {
+            let tags: Vec<&str> = inv.weaknesses.iter().map(|w| w.label()).collect();
+            println!("  {}:{}  [{}]  \"{}\"", inv.file, inv.line, tags.join(", "), inv.name);
+            println!("     {}", inv.predicate);
+            for w in &inv.weaknesses {
+                println!("     → {}: {}", w.label(), w.why());
+            }
+        }
+        println!();
+    }
+    if !clean.is_empty() {
+        println!("Structurally OK ({}) — reads state, can fail, unique:", clean.len());
+        for inv in &clean {
+            println!("  {}:{}  \"{}\"", inv.file, inv.line, inv.name);
+        }
+        println!();
+    }
+
+    println!(
+        "Scanned {} file(s): {} parsed, {} skipped. {} invariant(s), {} flagged.",
+        report.files_scanned,
+        report.files_parsed,
+        report.parse_failures.len(),
+        report.invariants.len(),
+        report.flagged(),
+    );
+    for f in &report.parse_failures {
+        println!("  warning: could not parse {f} (skipped)");
+    }
+
+    println!(
+        "\nNote: this flags STRUCTURALLY hollow invariants (can't fail / ignore state / \
+         duplicate). It cannot judge whether an invariant is CORRECT, or which ones you \
+         are MISSING — that is domain knowledge. Hand the prompt below to your LLM/agent \
+         for that critique (or run `review --prompt-only`)."
+    );
+    if !report.invariants.is_empty() {
+        println!("\n───── adversarial critique prompt (for your agent) ─────");
+        println!("{}", review_prompt(report));
+    }
+}
+
+/// Machine-readable form of `review`: the report (invariants + weaknesses) as JSON,
+/// plus the adversarial prompt an agent can act on directly.
+fn emit_review_json(report: &ReviewReport) {
+    use serde_json::json;
+    let doc = json!({
+        "invariants": report.invariants,
+        "flagged": report.flagged(),
+        "parse_failures": report.parse_failures,
+        "critique_prompt": review_prompt(report),
+    });
+    match serde_json::to_string_pretty(&doc) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("failed to serialize review: {e}"),
+    }
+}
+
+/// Build the adversarial critique prompt: the extracted invariants plus a framing
+/// that asks an LLM/agent for the DOMAIN-specific critique the tool can't do
+/// (missing properties, subtle tautologies, whether the set actually pins the
+/// behavior). Domain-agnostic on purpose — it names no vertical.
+fn review_prompt(report: &ReviewReport) -> String {
+    let mut p = String::new();
+    p.push_str(
+        "You are adversarially reviewing the INVARIANTS a deterministic-simulation test \
+         asserts about a system. Your job is to find what is WRONG or MISSING — do not \
+         praise. The invariants were written by the same author (or agent) who wrote the \
+         implementation, so they may quietly agree with a wrong rule.\n\n\
+         The declared invariants are:\n",
+    );
+    if report.invariants.is_empty() {
+        p.push_str("  (none found)\n");
+    } else {
+        for (i, inv) in report.invariants.iter().enumerate() {
+            let tags = if inv.weaknesses.is_empty() {
+                String::new()
+            } else {
+                let t: Vec<&str> = inv.weaknesses.iter().map(|w| w.label()).collect();
+                format!("   [static flags: {}]", t.join(", "))
+            };
+            p.push_str(&format!("  {}. \"{}\": {}{}\n", i + 1, inv.name, inv.predicate, tags));
+        }
+    }
+    p.push_str(
+        "\nCritique the set. Specifically:\n\
+         - Which are tautological or vacuous (can never fail / ignore the state)? Confirm \
+           or extend the static flags above.\n\
+         - Which important properties of THIS system are NOT asserted at all? Name the \
+           gaps concretely (e.g. conservation/no-loss, non-negativity, idempotency of \
+           retries, ordering/monotonicity, no double-effect, reversal correctness — \
+           whichever apply to what this system does).\n\
+         - Where could the implementation be wrong in a way NONE of these invariants \
+           would catch?\n\
+         - For each gap, propose the invariant (name + predicate) that would close it.\n\
+         Do not assume the invariants are correct just because they are present.",
+    );
+    p
 }
 
 /// A short, actionable next step for a finding, keyed off whether `migrate` can
