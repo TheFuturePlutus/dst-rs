@@ -462,9 +462,11 @@ fn tail2(path: &syn::Path) -> Option<(String, String)> {
 /// treated as possibly-non-empty and does NOT count as empty.
 fn is_empty_collection(expr: &syn::Expr) -> bool {
     match expr {
-        // `vec![]` — the `vec` macro with no tokens.
+        // `vec![]` — the `vec` macro with no tokens. Match on the path's LAST
+        // segment so a qualified `std::vec![]` / `alloc::vec![]` is recognized too.
         syn::Expr::Macro(m) => {
-            m.mac.path.is_ident("vec") && m.mac.tokens.is_empty()
+            m.mac.path.segments.last().is_some_and(|s| s.ident == "vec")
+                && m.mac.tokens.is_empty()
         }
         // `[]` — an empty array literal.
         syn::Expr::Array(a) => a.elems.is_empty(),
@@ -495,10 +497,10 @@ struct PresenceVisitor<'a> {
     /// `InvariantEngine::new([...])`. This alone means the file has invariants.
     real_invariant: bool,
     /// An engine was EVALUATED — a 2-arg `.check`/`.check_all`, or the UFCS
-    /// `InvariantEngine::check(...)` form. On its own this is weaker than
-    /// [`Self::real_invariant`]: an empty engine can also be `.check`ed and asserts
-    /// nothing, so `checked` only counts toward OK when [`Self::empty_engine`] is
-    /// not also set (see the classification in `check_source`).
+    /// `InvariantEngine::check(...)` form. Counts toward `Ok` on its own (an engine
+    /// built by a helper is checked here even though its type name never appears).
+    /// An empty engine that is `.check`ed is thus an accepted false OK — see the
+    /// classification note in `check_source`.
     checked: bool,
     empty_engine: bool,
     assert_macros: usize,
@@ -514,16 +516,21 @@ struct PresenceVisitor<'a> {
 
 impl PresenceVisitor<'_> {
     /// Record a sim-surface marker for `ident`, applying the local-shadow guard.
-    /// `line` is the 1-based span line, kept as the site's location.
-    fn note_sim_marker(&mut self, ident: &str, line: usize) {
+    /// `bare` is true when `ident` is the FIRST segment of its path (unqualified) —
+    /// the local-shadow guard applies ONLY to bare paths, so a local `struct
+    /// SimScheduler` never suppresses an explicitly-qualified `navian_dst::
+    /// SimScheduler` use. `line` is the 1-based span line, kept as the site's
+    /// location.
+    fn note_sim_marker(&mut self, ident: &str, bare: bool, line: usize) {
         // Inside a macro body: do not let sim markers create/extend a site (see
         // `macro_depth`). Invariant signals are still honored elsewhere.
         if self.macro_depth > 0 {
             return;
         }
-        // A name defined in this same file is the user's own symbol, not the
-        // navian-dst type — ignore it.
-        if self.local_defs.contains(ident) {
+        // A BARE name defined in this same file is the user's own symbol, not the
+        // navian-dst type — ignore it. A qualified path (e.g. `navian_dst::…`) is
+        // NOT shadow-guarded: the explicit namespace names the real type.
+        if bare && self.local_defs.contains(ident) {
             return;
         }
         if SIM_MARKERS.contains(&ident) {
@@ -538,11 +545,13 @@ impl PresenceVisitor<'_> {
 impl<'ast> Visit<'ast> for PresenceVisitor<'_> {
     fn visit_path(&mut self, p: &'ast syn::Path) {
         // Sim-surface detection: every segment is a candidate
-        // (`navian_dst::SimScheduler`, a bare `SimScheduler`, …).
-        for seg in &p.segments {
+        // (`navian_dst::SimScheduler`, a bare `SimScheduler`, …). The shadow guard
+        // applies only to the FIRST (unqualified) segment, so a local marker name
+        // never suppresses an explicitly-qualified `navian_dst::` use.
+        for (idx, seg) in p.segments.iter().enumerate() {
             let ident = seg.ident.to_string();
             let line = seg.ident.span().start().line;
-            self.note_sim_marker(&ident, line);
+            self.note_sim_marker(&ident, idx == 0, line);
         }
         // `Invariant::new` as a bare path (e.g. mapped/collected, not directly
         // the call form handled in visit_expr_call). Shadow-guarded on the type
@@ -796,6 +805,36 @@ mod tests {
         let site = one_site(src);
         assert_eq!(site.status, Status::Ok);
         assert!(site.has_invariant);
+    }
+
+    #[test]
+    fn qualified_use_survives_a_local_shadow() {
+        // The file defines its own `SimScheduler` AND uses the real qualified type.
+        // The local shadow must NOT suppress the explicitly-qualified use, so the
+        // file is still detected as a site.
+        let src = r#"
+            struct SimScheduler;
+            fn run() {
+                let real = navian_dst::SimScheduler::new(0);
+            }
+        "#;
+        let site = one_site(src);
+        assert_eq!(site.sim_markers, vec!["SimScheduler"]);
+        assert_eq!(site.status, Status::Missing);
+    }
+
+    #[test]
+    fn qualified_empty_vec_engine_is_missing() {
+        // `std::vec![]` is still an empty engine → MISSING, not OK.
+        let src = r#"
+            fn run() {
+                let s = SimScheduler::new(0);
+                let eng = InvariantEngine::new(std::vec![]);
+            }
+        "#;
+        let site = one_site(src);
+        assert_eq!(site.status, Status::Missing);
+        assert!(site.empty_engine);
     }
 
     #[test]

@@ -142,10 +142,12 @@ future addition but is **not** required for v1; the waiver is the escape hatch.
   `syn`-based invariant extraction + LLM critique.
 - Library seam: `crates/navian-dst/src/invariant.rs` (`InvariantEngine::is_empty`/
   `len` — the presence semantics the gate mirrors statically).
-- Tests: presence gate over fixtures (a vacuous sim → MISSING; an empty engine even
-  when `.check`ed → MISSING; a registered/checked invariant → OK; a delegated,
-  waived file → not gated). Feature-2 tests will cover review extraction over the
-  counter-world example in `invariant.rs`.
+- Tests: presence gate over fixtures (a vacuous sim → MISSING; an UNUSED empty
+  engine → MISSING; an empty engine that is `.check`ed → OK, the accepted false OK;
+  an empty engine beside a real helper-checked engine → OK, never a false MISSING;
+  a registered/checked invariant → OK; a delegated, waived file → not gated).
+  Feature-2 tests will cover review extraction over the counter-world example in
+  `invariant.rs`.
 
 ## References
 
