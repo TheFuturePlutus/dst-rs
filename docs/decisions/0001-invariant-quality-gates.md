@@ -42,13 +42,22 @@ determinism layer well. It does not yet touch invariant **quality**.
 ## Decision
 
 Add two invariant-quality features to `navian-dst-cli`, each matching the layer it
-belongs to:
+belongs to. They ship in **separate commits**: (1) presence enforcement lands first
+(the `invariants` subcommand); (2) adversarial review follows as its own command.
+This ADR governs both; only feature 1 is realized at the time of writing.
 
 1. **Presence enforcement (hard CI gate).** A static check that fails when a file
    exercises the simulation surface (`SimScheduler`, `FaultSchedule`,
    `SimulatedRandom`, the executor) but registers no invariants and never invokes
    `InvariantEngine::check`/`check_all`. It certifies *that assertions exist*, never
-   *that they are correct*.
+   *that they are correct*. Analysis is per FILE for v1 (a documented limitation:
+   a vacuous test can be masked by an assertion elsewhere in the same file — the
+   safe false-`Ok` direction; per-test attribution is a fast-follow, deferred
+   because the naive per-`fn` version would false-`Missing` on ordinary sim
+   helpers). An UNUSED empty `InvariantEngine::new(vec![])` counts as MISSING; an
+   empty engine that is later `.check`ed is an accepted false OK — file-global
+   analysis cannot distinguish it from a legitimately-checked helper engine in the
+   same file, and the cardinal rule forbids risking a false MISSING to catch it.
 
 2. **Adversarial invariant review (advisory only, never modifies code).** A
    subcommand that extracts each declared `Invariant` (its `name` and predicate
@@ -127,14 +136,16 @@ future addition but is **not** required for v1; the waiver is the escape hatch.
 
 ## Implementation references
 
-- Code (to add): `crates/navian-dst-cli/src/main.rs` (two new `Commands`),
-  a new presence rule set alongside `crates/navian-dst-cli/src/scanner.rs`, and a new
-  `review` module for `syn`-based invariant extraction + critique.
+- Feature 1 (shipped): `crates/navian-dst-cli/src/presence.rs` (the analyzer) and
+  the `Commands::Invariants` arm in `crates/navian-dst-cli/src/main.rs`.
+- Feature 2 (follow-up, not yet built): a `review` command + module for
+  `syn`-based invariant extraction + LLM critique.
 - Library seam: `crates/navian-dst/src/invariant.rs` (`InvariantEngine::is_empty`/
   `len` — the presence semantics the gate mirrors statically).
-- Tests: presence gate over fixture crates (a vacuous sim → fail; a sim with a
-  registered, checked invariant → pass); review extraction over the counter-world
-  example in `invariant.rs`.
+- Tests: presence gate over fixtures (a vacuous sim → MISSING; an empty engine even
+  when `.check`ed → MISSING; a registered/checked invariant → OK; a delegated,
+  waived file → not gated). Feature-2 tests will cover review extraction over the
+  counter-world example in `invariant.rs`.
 
 ## References
 

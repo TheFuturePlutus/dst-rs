@@ -268,6 +268,11 @@ enum Commands {
     /// and it only sees files it can read and parse — an unreadable file makes a
     /// `--deny` gate exit 2 rather than pass green.
     ///
+    /// SCOPE: analysis is per FILE. A file with several tests is one site, so a
+    /// vacuous simulation in one test can be masked by an assertion in another test
+    /// in the same file (a false OK — the safe direction). Per-test attribution is
+    /// a planned refinement.
+    ///
     /// Exit codes: 0 = clean (or findings without a gate); 1 = a gated tier fired;
     /// 2 = usage error, or (under a gate) a file could not be read/parsed.
     Invariants {
@@ -275,8 +280,8 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
 
-        /// Output format: `human` (default) or `json`. (`sarif`/`github` are not
-        /// meaningful here and fall back to `human`.)
+        /// Output format: `human` (default) or `json`. `sarif`/`github` are
+        /// rejected (exit 2) — they are not meaningful for this command.
         #[arg(long, value_enum, value_name = "human|json")]
         format: Option<Format>,
 

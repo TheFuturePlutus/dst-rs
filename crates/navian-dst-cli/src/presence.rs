@@ -18,17 +18,18 @@
 //! ## Two tiers
 //!
 //! * [`Status::Missing`] — a simulation site with **no assertions of any kind**
-//!   (no live [`navian_dst::InvariantEngine`], no `Invariant::new`, no `.check()`,
-//!   no `assert!` family macro). An `InvariantEngine::new(vec![])` with an EMPTY
-//!   list counts as missing: it registers nothing. This is the tier the `--deny`
-//!   gate fails on.
+//!   (no `Invariant::new`, no `.check()`, no `assert!` family macro). An UNUSED
+//!   `InvariantEngine::new(vec![])` — an empty engine that is never `.check`ed —
+//!   counts as missing: it registers nothing. This is the tier the `--deny` gate
+//!   fails on.
 //! * [`Status::RawOnly`] — a simulation site that asserts only through raw
 //!   `assert!`/`assert_eq!`/… macros and registers no declarative invariant.
 //!   Legitimate, but weaker than a declared invariant set; surfaced as ADVISORY
 //!   and fails the gate only under `--deny-raw`.
 //! * [`Status::Ok`] — a simulation site that constructs a real invariant
 //!   (`Invariant::new`, or a non-empty `InvariantEngine::new([...])`) or evaluates
-//!   one (`.check` / `.check_all`).
+//!   one (`.check` / `.check_all`). NOTE: an empty engine that IS `.check`ed lands
+//!   here too — an accepted false OK, see "Safe direction" below.
 //!
 //! A file that does **not** touch the simulation surface is not a site at all and
 //! is never reported — this gate is about DST tests, not arbitrary code.
@@ -39,8 +40,10 @@
 //! rules — it must never fire on a file that genuinely asserts. When the
 //! invariant signal is ambiguous the checker leans toward NOT reporting `Missing`
 //! (a vacuous file slipping to `Ok` is the safe error; failing a good test is
-//! not). The one unambiguous "registers nothing" shape — an empty engine literal
-//! — is the exception it will still catch.
+//! not). Concretely: an empty engine that is later `.check`ed is classified `Ok`,
+//! not `Missing` — file-global analysis cannot tell it from a legitimately-checked
+//! helper engine in the same file, and catching it would risk a forbidden false
+//! `Missing`. The unused empty engine (constructed, never checked) is still caught.
 //!
 //! ## Shadow guard
 //!
@@ -68,6 +71,15 @@
 //! *only* invariant signal the file reads as `Missing`; the [`WAIVER_MARKER`]
 //! covers it until alias resolution lands. These are false negatives in the safe
 //! direction only for files that also use a plainly-spelled invariant elsewhere.
+//!
+//! Analysis is per FILE, not per function. A file that holds several tests is a
+//! single site, so a vacuous simulation in one test is masked by an assertion in a
+//! *different* test in the same file — a false `Ok` (the accepted safe direction).
+//! Per-test attribution is a deliberate non-goal for v1: the naive version — treat
+//! each `fn` as its own site — would flag every ordinary `fn make_sim() ->
+//! SimScheduler` helper as `Missing` (a false *positive*, which the cardinal rule
+//! forbids). Doing it right needs test-attribute scoping plus cross-function
+//! awareness, and is left as a fast-follow.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -191,8 +203,11 @@ pub struct Site {
     pub sim_line: usize,
     /// Whether a real (non-empty) declarative invariant was found.
     pub has_invariant: bool,
-    /// Whether an EMPTY `InvariantEngine::new([])` was seen — reported as the
-    /// specific reason a site is `Missing` despite naming the engine type.
+    /// Whether an EMPTY `InvariantEngine::new([])` was seen anywhere in the file.
+    /// When the site is `Missing`, this is surfaced as the specific reason. It can
+    /// also co-occur with an `Ok` verdict (`has_invariant` true) — e.g. an empty
+    /// engine that is `.check`ed (an accepted false OK), or an empty engine sitting
+    /// beside a real invariant — so it is informational, not a `Missing` implier.
     pub empty_engine: bool,
     /// Count of raw `assert!`-family macro invocations.
     pub assert_macros: usize,
@@ -263,7 +278,22 @@ pub fn check_path(root: &Path) -> PresenceReport {
         }
     });
 
-    for entry in walker.filter_map(Result::ok) {
+    for entry in walker {
+        // A traversal error (an unreadable directory, a broken symlink, a
+        // permission failure) must NOT be silently dropped: under a `--deny` gate
+        // that would let the run exit 0 on a tree it never fully walked. Record it
+        // as a failure so the gate becomes uncertifiable (exit 2).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                let where_ = e
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unknown path>".to_string());
+                report.parse_failures.push(format!("{where_}: {e}"));
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
@@ -321,7 +351,8 @@ pub fn check_source(file: &str, content: &str, report: &mut PresenceReport) {
         local_defs: &defs.names,
         sim_markers: Vec::new(),
         sim_line: 0,
-        has_invariant: false,
+        real_invariant: false,
+        checked: false,
         empty_engine: false,
         assert_macros: 0,
         macro_depth: 0,
@@ -333,7 +364,20 @@ pub fn check_source(file: &str, content: &str, report: &mut PresenceReport) {
         return;
     }
 
-    let status = if v.has_invariant {
+    // A real invariant was CONSTRUCTED (`Invariant::new`, a non-empty engine) or an
+    // engine was EVALUATED (a 2-arg `.check`). An UNUSED empty engine
+    // (`InvariantEngine::new(vec![])` with no check) has neither signal → MISSING,
+    // the common "forgot to add invariants" mistake.
+    //
+    // We deliberately do NOT subtract the file-global `empty_engine` flag here. An
+    // empty engine that IS later `.check`ed is an accepted false OK: file-global
+    // analysis cannot distinguish that empty engine from a legitimately-checked
+    // helper-built engine elsewhere in the same multi-test file, and the cardinal
+    // rule forbids risking a false MISSING (failing a file that genuinely asserts)
+    // to catch it. False OK is the safe direction; see the module docs.
+    let has_invariant = v.real_invariant || v.checked;
+
+    let status = if has_invariant {
         Status::Ok
     } else if v.assert_macros > 0 {
         Status::RawOnly
@@ -350,7 +394,7 @@ pub fn check_source(file: &str, content: &str, report: &mut PresenceReport) {
         status,
         sim_markers,
         sim_line: v.sim_line,
-        has_invariant: v.has_invariant,
+        has_invariant,
         empty_engine: v.empty_engine,
         assert_macros: v.assert_macros,
         // An author opt-out: the file declares its invariants live elsewhere.
@@ -447,7 +491,15 @@ struct PresenceVisitor<'a> {
     local_defs: &'a HashSet<String>,
     sim_markers: Vec<String>,
     sim_line: usize,
-    has_invariant: bool,
+    /// A real invariant was CONSTRUCTED — `Invariant::new`, or a non-empty
+    /// `InvariantEngine::new([...])`. This alone means the file has invariants.
+    real_invariant: bool,
+    /// An engine was EVALUATED — a 2-arg `.check`/`.check_all`, or the UFCS
+    /// `InvariantEngine::check(...)` form. On its own this is weaker than
+    /// [`Self::real_invariant`]: an empty engine can also be `.check`ed and asserts
+    /// nothing, so `checked` only counts toward OK when [`Self::empty_engine`] is
+    /// not also set (see the classification in `check_source`).
+    checked: bool,
     empty_engine: bool,
     assert_macros: usize,
     /// Depth of macro bodies we are currently walking. syn does not descend into
@@ -497,7 +549,7 @@ impl<'ast> Visit<'ast> for PresenceVisitor<'_> {
         // name so a local `struct Invariant` does not count.
         if let Some((ty, method)) = tail2(p) {
             if ty == "Invariant" && method == "new" && !self.local_defs.contains("Invariant") {
-                self.has_invariant = true;
+                self.real_invariant = true;
             }
         }
         visit::visit_path(self, p);
@@ -509,14 +561,15 @@ impl<'ast> Visit<'ast> for PresenceVisitor<'_> {
                 if method == "new" {
                     // `Invariant::new(...)` — a real invariant is constructed.
                     if ty == "Invariant" && !self.local_defs.contains("Invariant") {
-                        self.has_invariant = true;
+                        self.real_invariant = true;
                     }
-                    // `InvariantEngine::new(arg)` — Ok only if the arg is NOT an
-                    // empty collection literal. An empty engine registers nothing.
+                    // `InvariantEngine::new(arg)` — a real invariant only if the arg
+                    // is NOT an empty collection literal. An empty engine registers
+                    // nothing (and later suppresses a `.check` on it, see below).
                     if ty == "InvariantEngine" && !self.local_defs.contains("InvariantEngine") {
                         match c.args.first() {
                             Some(arg) if is_empty_collection(arg) => self.empty_engine = true,
-                            Some(_) => self.has_invariant = true,
+                            Some(_) => self.real_invariant = true,
                             None => self.empty_engine = true,
                         }
                     }
@@ -526,8 +579,9 @@ impl<'ast> Visit<'ast> for PresenceVisitor<'_> {
                 {
                     // UFCS form: `InvariantEngine::check(&eng, step, &state)`. The
                     // fully-qualified type makes this unambiguous, so — unlike the
-                    // receiver-syntax arm below — no arity narrowing is needed.
-                    self.has_invariant = true;
+                    // receiver-syntax arm below — no arity narrowing is needed. It is
+                    // an EVALUATION signal (`checked`), not construction.
+                    self.checked = true;
                 }
             }
         }
@@ -543,7 +597,7 @@ impl<'ast> Visit<'ast> for PresenceVisitor<'_> {
         // is fixed at two args, so this never drops a genuine engine check.
         let method = m.method.to_string();
         if INVARIANT_CHECK_METHODS.contains(&method.as_str()) && m.args.len() == 2 {
-            self.has_invariant = true;
+            self.checked = true;
         }
         visit::visit_expr_method_call(self, m);
     }
@@ -673,6 +727,45 @@ mod tests {
         let site = one_site(src);
         assert_eq!(site.status, Status::Ok);
         assert!(site.has_invariant);
+    }
+
+    #[test]
+    fn empty_engine_then_checked_is_accepted_false_ok() {
+        // `InvariantEngine::new(vec![])` that is later `.check`ed IS vacuous, but we
+        // classify it OK on purpose: file-global analysis cannot tell this empty
+        // engine from a legit helper-checked engine in the same file, and the
+        // cardinal rule forbids risking a false MISSING to catch it. Documented
+        // false OK — the UNUSED empty-engine mistake is still caught (see
+        // `empty_invariant_engine_is_missing`).
+        let src = r#"
+            fn run() {
+                let s = SimScheduler::new(0);
+                let eng = InvariantEngine::new(vec![]);
+                for i in 0..1000 { let _ = eng.check(i, &world); }
+            }
+        "#;
+        let site = one_site(src);
+        assert_eq!(site.status, Status::Ok, "accepted false OK, per cardinal rule");
+        assert!(site.empty_engine, "still recorded as having an empty engine");
+    }
+
+    #[test]
+    fn empty_engine_beside_real_helper_check_is_ok_not_missing() {
+        // The regression the cardinal rule protects: an empty-engine baseline test
+        // next to a real helper-checked test in the SAME file must NOT false-MISSING.
+        let src = r#"
+            fn baseline() {
+                let s = SimScheduler::new(0);
+                let eng = InvariantEngine::new(vec![]);
+            }
+            fn real_test() {
+                let s = SimScheduler::new(0);
+                let eng = make_engine();
+                for i in 0..100 { let _ = eng.check(i, &world); }
+            }
+        "#;
+        let site = one_site(src);
+        assert_eq!(site.status, Status::Ok, "helper-checked engine must keep the file OK");
     }
 
     #[test]
