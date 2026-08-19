@@ -10,8 +10,9 @@
 //!
 //! For every `Invariant::new("name", |state| …)` it finds:
 //!
-//! * **Tautology** — the predicate can never be false (`|_| true`, `|w| cond || true`,
-//!   a body that just returns `true`). A check that can't fail is not a check.
+//! * **Tautology** — the predicate can never be false (`|_| true`, a pure
+//!   `|w| cond || true`, a body that is just `{ true }`). A check that can't fail is
+//!   not a check.
 //!   (Self-equality `w.x == w.x` is deliberately NOT treated as a tautology — without
 //!   types it is unsound: `NaN != NaN`, and a custom `PartialEq` may be non-reflexive.)
 //! * **Ignores state** — the predicate does not read the `state` parameter it is
@@ -440,17 +441,54 @@ fn is_trivially_true(expr: &syn::Expr) -> bool {
         syn::Expr::Paren(p) => is_trivially_true(&p.expr),
         // `{ …; trailing }` — trivially true iff the trailing expr is.
         syn::Expr::Block(b) => block_is_trivially_true(&b.block),
-        // `_ || true` / `true || _`. NOTE: we deliberately do NOT treat `a == a` as
-        // a tautology — without type information it is unsound (`NaN != NaN` makes
-        // `w.f == w.f` a real not-NaN check, and a custom `PartialEq` may be
-        // non-reflexive). A syn-only analyzer can't prove reflexivity, so it stays
-        // conservative and leaves self-equality for the agent critique to weigh.
+        // `pure || true` / `true || _`. The left operand is evaluated FIRST, so
+        // `_ || true` is a tautology only when that left side cannot itself fail —
+        // `w.opt.unwrap() > 0 || true` can panic before the `|| true` is reached.
+        // NOTE: we deliberately do NOT treat `a == a` as a tautology — without types
+        // it is unsound (`NaN != NaN` makes `w.f == w.f` a real not-NaN check, and a
+        // custom `PartialEq` may be non-reflexive).
         syn::Expr::Binary(bin) => match bin.op {
-            syn::BinOp::Or(_) => is_trivially_true(&bin.left) || is_trivially_true(&bin.right),
+            syn::BinOp::Or(_) => {
+                is_trivially_true(&bin.left)
+                    || (is_trivially_true(&bin.right) && is_pure_operand(&bin.left))
+            }
             _ => false,
         },
         _ => false,
     }
+}
+
+/// Whether an expression cannot itself fail/panic or observe side effects — no
+/// calls, method calls, macros, indexing, `?`, or `.await`. Used to decide whether
+/// the left side of `_ || true` is safe (a panic there would make the predicate
+/// failable, so `_ || true` would not be a tautology).
+fn is_pure_operand(e: &syn::Expr) -> bool {
+    struct Impure {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Impure {
+        fn visit_expr_call(&mut self, _: &'ast syn::ExprCall) {
+            self.found = true;
+        }
+        fn visit_expr_method_call(&mut self, _: &'ast syn::ExprMethodCall) {
+            self.found = true;
+        }
+        fn visit_expr_macro(&mut self, _: &'ast syn::ExprMacro) {
+            self.found = true;
+        }
+        fn visit_expr_index(&mut self, _: &'ast syn::ExprIndex) {
+            self.found = true;
+        }
+        fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
+            self.found = true;
+        }
+        fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
+            self.found = true;
+        }
+    }
+    let mut v = Impure { found: false };
+    v.visit_expr(e);
+    !v.found
 }
 
 /// A block is trivially true ONLY when it is a single trailing trivially-true expr
@@ -568,9 +606,20 @@ mod tests {
     }
 
     #[test]
-    fn flags_or_true_tautology() {
+    fn flags_pure_or_true_tautology() {
         let inv = one(r#"fn f() { Invariant::new("x", |w: &W| w.a > 0 || true); }"#);
         assert!(inv.weaknesses.contains(&Weakness::Tautology));
+    }
+
+    #[test]
+    fn impure_or_true_is_not_tautology() {
+        // The left side can panic before `|| true` is reached → failable.
+        let inv = one(r#"fn f() { Invariant::new("x", |w: &W| w.opt.unwrap() > 0 || true); }"#);
+        assert!(
+            !inv.weaknesses.contains(&Weakness::Tautology),
+            "impure left of || true can fail; got {:?}",
+            inv.weaknesses
+        );
     }
 
     #[test]
