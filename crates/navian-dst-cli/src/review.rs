@@ -32,7 +32,10 @@
 //! Like [`crate::scanner`]/[`crate::presence`] this is a NAME/AST heuristic, not a
 //! sound analyzer: it errs toward NOT flagging (a hollow invariant slipping through
 //! is safer than nagging about a real one), and it only sees `Invariant::new` spelled
-//! plainly (no alias/type-alias resolution — a documented limitation).
+//! plainly (no alias/type-alias resolution — a documented limitation). IGNORES-STATE
+//! is also not scope-aware: `|w| { let w = GLOBAL; … }` (the param shadowed by a
+//! local) reads "uses state" even though it doesn't — a false NEGATIVE, the safe
+//! direction, so it is accepted rather than risk a false positive.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -91,9 +94,10 @@ pub struct Invariant {
     pub line: usize,
     /// Structural weaknesses found (may be empty).
     pub weaknesses: Vec<Weakness>,
-    /// Internal: the invariant SET this belongs to (file + enclosing fn), so
-    /// DUPLICATE is detected only WITHIN one declared set — two independent tests
-    /// that each assert the same property are not duplicates of each other.
+    /// Internal: the invariant SET this belongs to — `file#setN` for invariants in
+    /// the same `vec!`, or a unique `file#soloN` for a loose call. DUPLICATE is
+    /// detected only WITHIN one set, so two independent `vec!`s (or two tests) that
+    /// each assert the same property are not duplicates of each other.
     #[serde(skip)]
     scope: String,
 }
@@ -193,13 +197,12 @@ pub fn review_source(file: &str, content: &str, report: &mut ReviewReport) {
     };
     report.files_parsed += 1;
 
-    // Local shadow guard: a file that defines its own `Invariant` type is not using
-    // navian-dst's — don't extract from it.
+    // Local shadow guard: if the file defines its own `Invariant` type, a BARE
+    // `Invariant::new(...)` is the user's own — but an explicitly-qualified
+    // `navian_dst::Invariant::new(...)` in the same file is still the real one. So
+    // the guard is applied per-call (on bare paths), not by skipping the whole file.
     let mut defs = LocalDefs::default();
     defs.visit_file(&ast);
-    if defs.defines_invariant {
-        return;
-    }
 
     let lines: Vec<Vec<char>> = content.lines().map(|l| l.chars().collect()).collect();
     let mut v = ExtractVisitor {
@@ -209,15 +212,17 @@ pub fn review_source(file: &str, content: &str, report: &mut ReviewReport) {
         macro_depth: 0,
         set_stack: Vec::new(),
         next_id: 0,
+        local_invariant: defs.defines_invariant,
     };
     v.visit_file(&ast);
     report.invariants.append(&mut v.out);
 }
 
 /// Mark invariants whose (normalized) predicate source is shared by another IN THE
-/// SAME SET (scope = file + enclosing fn). The FIRST occurrence in a set is not
-/// flagged; each subsequent duplicate is. Scoping matters: two independent tests
-/// that each legitimately assert `|w| w.balance >= 0` are NOT duplicates.
+/// SAME SET (see [`Invariant::scope`] — one `vec!`). The FIRST occurrence in a set
+/// is not flagged; each subsequent duplicate is. Scoping matters: two independent
+/// `vec!`s (or two tests) that each legitimately assert `|w| w.balance >= 0` are NOT
+/// duplicates.
 fn mark_duplicates(invariants: &mut [Invariant]) {
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
     for inv in invariants.iter_mut() {
@@ -282,6 +287,9 @@ struct ExtractVisitor<'a> {
     set_stack: Vec<u64>,
     /// Monotonic id source for sets AND for "solo" invariants (unique per call).
     next_id: u64,
+    /// The file defines its own `Invariant` type, so a BARE `Invariant::new` is the
+    /// user's own — but a qualified `navian_dst::Invariant::new` is still extracted.
+    local_invariant: bool,
 }
 
 impl ExtractVisitor<'_> {
@@ -331,7 +339,11 @@ impl ExtractVisitor<'_> {
 impl<'ast> Visit<'ast> for ExtractVisitor<'_> {
     fn visit_expr_call(&mut self, c: &'ast syn::ExprCall) {
         if let syn::Expr::Path(p) = &*c.func {
-            if is_invariant_new(&p.path) {
+            // A BARE `Invariant::new` (2 segments) in a file that defines its own
+            // `Invariant` type is the user's symbol — skip it. Qualified paths
+            // (`navian_dst::Invariant::new`) are always the real one.
+            let bare = p.path.segments.len() == 2;
+            if is_invariant_new(&p.path) && !(bare && self.local_invariant) {
                 let name = c.args.first().and_then(name_of).unwrap_or_else(|| "<non-literal>".to_string());
                 if let Some(pred) = c.args.get(1) {
                     let predicate = self.source_of(pred);
@@ -441,44 +453,15 @@ fn is_trivially_true(expr: &syn::Expr) -> bool {
     }
 }
 
-/// A block is trivially true iff its final expression is trivially true AND nothing
-/// in the block can early-exit with a different value. Without the early-exit check
-/// a guard clause — `{ if bad { return false; } true }` — would be misread as a
-/// tautology even though it CAN return false.
+/// A block is trivially true ONLY when it is a single trailing trivially-true expr
+/// (`{ true }`, `{ cond || true }`). Any PRIOR statement is disqualifying: it could
+/// early-exit (`return false`, a value-bearing `break`) OR fail by panicking on the
+/// state (`assert!(w.ok); true`, `w.opt.unwrap(); true`) — the engine does not catch
+/// a predicate panic, so such a block CAN fail and is not a tautology. Requiring a
+/// lone trailing expression rules out that whole class conservatively.
 fn block_is_trivially_true(block: &syn::Block) -> bool {
-    let trailing_true =
-        matches!(block.stmts.last(), Some(syn::Stmt::Expr(e, None)) if is_trivially_true(e));
-    trailing_true && !block_has_early_exit(block)
-}
-
-/// Whether a block can exit early with a value via `return`, `?`, or a
-/// value-bearing `break <expr>` (a labelled `break 'blk false` yields the block) —
-/// NOT counting such control flow inside a nested closure (that belongs to the
-/// inner closure).
-fn block_has_early_exit(block: &syn::Block) -> bool {
-    struct EarlyExit {
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for EarlyExit {
-        fn visit_expr_return(&mut self, _: &'ast syn::ExprReturn) {
-            self.found = true;
-        }
-        fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
-            self.found = true;
-        }
-        fn visit_expr_break(&mut self, b: &'ast syn::ExprBreak) {
-            // A `break <expr>` can yield a different value from a labelled block or a
-            // `loop`. Conservatively treat any value-bearing break as an early exit.
-            if b.expr.is_some() {
-                self.found = true;
-            }
-        }
-        // A nested closure's control flow returns from IT, not from our predicate.
-        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
-    }
-    let mut e = EarlyExit { found: false };
-    e.visit_block(block);
-    e.found
+    block.stmts.len() == 1
+        && matches!(block.stmts.first(), Some(syn::Stmt::Expr(e, None)) if is_trivially_true(e))
 }
 
 /// Whether a closure never reads the state parameter it is handed. `|_| …` ignores
@@ -591,9 +574,28 @@ mod tests {
     }
 
     #[test]
-    fn flags_block_returning_true() {
-        let inv = one(r#"fn f() { Invariant::new("x", |w: &W| { let _ = w; true }); }"#);
+    fn single_true_block_is_tautology() {
+        let inv = one(r#"fn f() { Invariant::new("x", |_w: &W| { true }); }"#);
         assert!(inv.weaknesses.contains(&Weakness::Tautology));
+    }
+
+    #[test]
+    fn block_with_prior_statement_is_not_tautology() {
+        // A prior statement can panic on state (`assert!`, `unwrap`) → the predicate
+        // CAN fail, so `{ stmt; true }` is not a proven tautology.
+        for body in [
+            "{ assert!(w.ok); true }",
+            "{ w.opt.unwrap(); true }",
+            "{ if w.bad { return false; } true }",
+        ] {
+            let src = format!("fn f() {{ Invariant::new(\"x\", |w: &W| {body}); }}");
+            let inv = one(&src);
+            assert!(
+                !inv.weaknesses.contains(&Weakness::Tautology),
+                "`{body}` can fail; not a tautology, got {:?}",
+                inv.weaknesses
+            );
+        }
     }
 
     #[test]
@@ -736,14 +738,20 @@ mod tests {
     }
 
     #[test]
-    fn local_invariant_type_is_shadow_guarded() {
+    fn local_invariant_type_shadows_only_bare_calls() {
+        // A file that defines its own `Invariant` type: the BARE call is the user's
+        // own (skipped), but a qualified `navian_dst::Invariant::new` is still real.
         let src = r#"
             struct Invariant;
             impl Invariant { fn new(_a: &str, _b: u8) {} }
-            fn f() { Invariant::new("x", 3); }
+            fn f() {
+                Invariant::new("mine", 3);
+                navian_dst::Invariant::new("real", |w: &W| w.balance >= 0);
+            }
         "#;
         let r = review(src);
-        assert!(r.invariants.is_empty(), "local Invariant type must not be reviewed");
+        assert_eq!(r.invariants.len(), 1, "only the qualified real one is reviewed");
+        assert_eq!(r.invariants[0].name, "real");
     }
 
     #[test]
