@@ -311,7 +311,8 @@ enum Commands {
     /// author owns. The domain-specific "which invariants are you MISSING?" critique
     /// is emitted as an adversarial PROMPT you hand to your own LLM/agent (the domain
     /// knowledge lives there, not in a domain-agnostic tool). This command votes; it
-    /// never gates and never rewrites your code — it always exits 0.
+    /// never gates and never rewrites your code — findings never affect the exit
+    /// code (always 0); only a usage error (bad --format, missing path) exits 2.
     Review {
         /// Directory (or file) to review. Defaults to the current directory.
         #[arg(default_value = ".")]

@@ -90,6 +90,11 @@ pub struct Invariant {
     pub line: usize,
     /// Structural weaknesses found (may be empty).
     pub weaknesses: Vec<Weakness>,
+    /// Internal: the invariant SET this belongs to (file + enclosing fn), so
+    /// DUPLICATE is detected only WITHIN one declared set — two independent tests
+    /// that each assert the same property are not duplicates of each other.
+    #[serde(skip)]
+    scope: String,
 }
 
 /// Aggregate result of a review run.
@@ -201,22 +206,25 @@ pub fn review_source(file: &str, content: &str, report: &mut ReviewReport) {
         lines: &lines,
         out: Vec::new(),
         macro_depth: 0,
+        fn_stack: Vec::new(),
     };
     v.visit_file(&ast);
     report.invariants.append(&mut v.out);
 }
 
-/// Mark invariants whose (normalized) predicate source is shared by another. The
-/// FIRST occurrence is not flagged; each subsequent duplicate is.
+/// Mark invariants whose (normalized) predicate source is shared by another IN THE
+/// SAME SET (scope = file + enclosing fn). The FIRST occurrence in a set is not
+/// flagged; each subsequent duplicate is. Scoping matters: two independent tests
+/// that each legitimately assert `|w| w.balance >= 0` are NOT duplicates.
 fn mark_duplicates(invariants: &mut [Invariant]) {
-    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
     for inv in invariants.iter_mut() {
-        let key = normalize_ws(&inv.predicate);
+        let pred = normalize_ws(&inv.predicate);
         // An empty/degenerate predicate string is not a meaningful duplicate key.
-        if key.is_empty() {
+        if pred.is_empty() {
             continue;
         }
-        let count = seen.entry(key).or_insert(0);
+        let count = seen.entry((inv.scope.clone(), pred)).or_insert(0);
         if *count > 0 && !inv.weaknesses.contains(&Weakness::Duplicate) {
             inv.weaknesses.push(Weakness::Duplicate);
         }
@@ -268,12 +276,22 @@ struct ExtractVisitor<'a> {
     /// macro token streams, so `InvariantEngine::new(vec![Invariant::new(...)])` —
     /// the overwhelmingly common shape — would be invisible without this.
     macro_depth: u32,
+    /// Enclosing `fn` names, innermost last — the scope key for duplicate detection.
+    fn_stack: Vec<String>,
+}
+
+impl ExtractVisitor<'_> {
+    /// The current invariant-set scope: file + innermost enclosing fn (or module).
+    fn scope(&self) -> String {
+        format!("{}#{}", self.file, self.fn_stack.last().map_or("<module>", String::as_str))
+    }
 }
 
 impl ExtractVisitor<'_> {
     /// Slice the source text spanned by `node` out of the original file, so the
     /// predicate is reported exactly as written. Returns a whitespace-normalized
-    /// single line. Falls back to token rendering if span coordinates are absent.
+    /// single line, or an empty string if span coordinates are absent (they are
+    /// present here — we parse from an in-memory string with `span-locations` on).
     fn source_of(&self, node: &impl syn::spanned::Spanned) -> String {
         let span = node.span();
         let (s_line, s_col) = (span.start().line, span.start().column);
@@ -305,17 +323,31 @@ impl<'ast> Visit<'ast> for ExtractVisitor<'_> {
                     let predicate = self.source_of(pred);
                     let weaknesses = predicate_weaknesses(pred);
                     let line = predicate_line(pred).max(1);
+                    let scope = self.scope();
                     self.out.push(Invariant {
                         name,
                         predicate,
                         file: self.file.to_string(),
                         line,
                         weaknesses,
+                        scope,
                     });
                 }
             }
         }
         visit::visit_expr_call(self, c);
+    }
+
+    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
+        self.fn_stack.push(f.sig.ident.to_string());
+        visit::visit_item_fn(self, f);
+        self.fn_stack.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
+        self.fn_stack.push(f.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, f);
+        self.fn_stack.pop();
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
@@ -388,13 +420,12 @@ fn is_trivially_true(expr: &syn::Expr) -> bool {
         syn::Expr::Paren(p) => is_trivially_true(&p.expr),
         // `{ …; trailing }` — trivially true iff the trailing expr is.
         syn::Expr::Block(b) => block_is_trivially_true(&b.block),
-        // `a == a` (token-identical, side-effect-free operands) or `_ || true`.
+        // `_ || true` / `true || _`. NOTE: we deliberately do NOT treat `a == a` as
+        // a tautology — without type information it is unsound (`NaN != NaN` makes
+        // `w.f == w.f` a real not-NaN check, and a custom `PartialEq` may be
+        // non-reflexive). A syn-only analyzer can't prove reflexivity, so it stays
+        // conservative and leaves self-equality for the agent critique to weigh.
         syn::Expr::Binary(bin) => match bin.op {
-            syn::BinOp::Eq(_) => {
-                exprs_token_eq(&bin.left, &bin.right)
-                    && is_pure_operand(&bin.left)
-                    && is_pure_operand(&bin.right)
-            }
             syn::BinOp::Or(_) => is_trivially_true(&bin.left) || is_trivially_true(&bin.right),
             _ => false,
         },
@@ -412,8 +443,10 @@ fn block_is_trivially_true(block: &syn::Block) -> bool {
     trailing_true && !block_has_early_exit(block)
 }
 
-/// Whether a block can exit early with a value via `return` or `?` — NOT counting
-/// such control flow inside a nested closure (that belongs to the inner closure).
+/// Whether a block can exit early with a value via `return`, `?`, or a
+/// value-bearing `break <expr>` (a labelled `break 'blk false` yields the block) —
+/// NOT counting such control flow inside a nested closure (that belongs to the
+/// inner closure).
 fn block_has_early_exit(block: &syn::Block) -> bool {
     struct EarlyExit {
         found: bool,
@@ -425,45 +458,19 @@ fn block_has_early_exit(block: &syn::Block) -> bool {
         fn visit_expr_try(&mut self, _: &'ast syn::ExprTry) {
             self.found = true;
         }
-        // A nested closure's `return` returns from IT, not from our predicate.
+        fn visit_expr_break(&mut self, b: &'ast syn::ExprBreak) {
+            // A `break <expr>` can yield a different value from a labelled block or a
+            // `loop`. Conservatively treat any value-bearing break as an early exit.
+            if b.expr.is_some() {
+                self.found = true;
+            }
+        }
+        // A nested closure's control flow returns from IT, not from our predicate.
         fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
     }
     let mut e = EarlyExit { found: false };
     e.visit_block(block);
     e.found
-}
-
-/// Token-level structural equality of two expressions (`x.y == x.y`), via their
-/// rendered token streams. Cheap and good enough for the `a == a` tautology.
-fn exprs_token_eq(a: &syn::Expr, b: &syn::Expr) -> bool {
-    use quote::ToTokens;
-    a.to_token_stream().to_string() == b.to_token_stream().to_string()
-}
-
-/// Whether an expression is free of calls/macros — so two token-equal copies of it
-/// genuinely evaluate the same. `w.draw() == w.draw()` is token-equal but the calls
-/// may differ, so it is NOT a tautology; `w.a == w.a` on plain fields is.
-fn is_pure_operand(e: &syn::Expr) -> bool {
-    struct Impure {
-        found: bool,
-    }
-    impl<'ast> Visit<'ast> for Impure {
-        fn visit_expr_call(&mut self, _: &'ast syn::ExprCall) {
-            self.found = true;
-        }
-        fn visit_expr_method_call(&mut self, _: &'ast syn::ExprMethodCall) {
-            self.found = true;
-        }
-        fn visit_expr_macro(&mut self, _: &'ast syn::ExprMacro) {
-            self.found = true;
-        }
-        fn visit_expr_await(&mut self, _: &'ast syn::ExprAwait) {
-            self.found = true;
-        }
-    }
-    let mut v = Impure { found: false };
-    v.visit_expr(e);
-    !v.found
 }
 
 /// Whether a closure never reads the state parameter it is handed. `|_| …` ignores
@@ -562,9 +569,11 @@ mod tests {
     }
 
     #[test]
-    fn flags_self_equality_tautology() {
-        let inv = one(r#"fn f() { Invariant::new("x", |w: &W| w.a == w.a); }"#);
-        assert!(inv.weaknesses.contains(&Weakness::Tautology));
+    fn self_equality_is_not_treated_as_tautology() {
+        // Unsound without types: `NaN != NaN`, and custom PartialEq may be
+        // non-reflexive. `|w| w.a == w.a` must NOT be flagged.
+        let inv = one(r#"fn f() { Invariant::new("not_nan", |w: &W| w.latency == w.latency); }"#);
+        assert!(!inv.weaknesses.contains(&Weakness::Tautology), "self-eq is not a proven tautology");
     }
 
     #[test]
@@ -603,13 +612,14 @@ mod tests {
     }
 
     #[test]
-    fn self_equality_of_method_calls_is_not_tautology() {
-        // `w.draw() == w.draw()` is token-equal but the calls may differ → NOT a
-        // guaranteed tautology.
-        let inv = one(r#"fn f() { Invariant::new("x", |w: &W| w.draw() == w.draw()); }"#);
+    fn labelled_break_false_is_not_tautology() {
+        // Ends in `true` but can yield `false` via a labelled break → failable.
+        let inv = one(
+            r#"fn f() { Invariant::new("x", |w: &W| 'c: { if w.bad { break 'c false; } true }); }"#,
+        );
         assert!(
             !inv.weaknesses.contains(&Weakness::Tautology),
-            "impure self-equality is not a tautology; got {:?}",
+            "labelled break false is an early exit; got {:?}",
             inv.weaknesses
         );
     }
@@ -645,6 +655,20 @@ mod tests {
         // First not flagged, second flagged duplicate.
         assert!(!r.invariants[0].weaknesses.contains(&Weakness::Duplicate));
         assert!(r.invariants[1].weaknesses.contains(&Weakness::Duplicate));
+    }
+
+    #[test]
+    fn same_predicate_in_different_functions_is_not_duplicate() {
+        // Two independent tests each legitimately asserting the same property are
+        // NOT duplicates — duplicate detection is scoped to one invariant set.
+        let src = r#"
+            fn test_a() { let _ = Invariant::new("bal", |w: &W| w.balance >= 0); }
+            fn test_b() { let _ = Invariant::new("bal", |w: &W| w.balance >= 0); }
+        "#;
+        let r = review(src);
+        assert_eq!(r.invariants.len(), 2);
+        assert!(r.invariants.iter().all(|i| !i.weaknesses.contains(&Weakness::Duplicate)),
+            "cross-function repeats are not duplicates");
     }
 
     #[test]
