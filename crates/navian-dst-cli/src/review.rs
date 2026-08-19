@@ -10,9 +10,10 @@
 //!
 //! For every `Invariant::new("name", |state| …)` it finds:
 //!
-//! * **Tautology** — the predicate can never be false (`|_| true`, `|w| w.x == w.x`,
-//!   `|w| cond || true`, a body that just returns `true`). A check that can't fail
-//!   is not a check.
+//! * **Tautology** — the predicate can never be false (`|_| true`, `|w| cond || true`,
+//!   a body that just returns `true`). A check that can't fail is not a check.
+//!   (Self-equality `w.x == w.x` is deliberately NOT treated as a tautology — without
+//!   types it is unsound: `NaN != NaN`, and a custom `PartialEq` may be non-reflexive.)
 //! * **Ignores state** — the predicate does not read the `state` parameter it is
 //!   handed (`|_| CONST > 0`, or a bound name that never appears in the body). It
 //!   asserts something, but nothing *about the run*.
@@ -206,7 +207,8 @@ pub fn review_source(file: &str, content: &str, report: &mut ReviewReport) {
         lines: &lines,
         out: Vec::new(),
         macro_depth: 0,
-        fn_stack: Vec::new(),
+        set_stack: Vec::new(),
+        next_id: 0,
     };
     v.visit_file(&ast);
     report.invariants.append(&mut v.out);
@@ -276,14 +278,26 @@ struct ExtractVisitor<'a> {
     /// macro token streams, so `InvariantEngine::new(vec![Invariant::new(...)])` —
     /// the overwhelmingly common shape — would be invisible without this.
     macro_depth: u32,
-    /// Enclosing `fn` names, innermost last — the scope key for duplicate detection.
-    fn_stack: Vec<String>,
+    /// Ids of the `vec!` invariant SETS we are currently inside, innermost last.
+    set_stack: Vec<u64>,
+    /// Monotonic id source for sets AND for "solo" invariants (unique per call).
+    next_id: u64,
 }
 
 impl ExtractVisitor<'_> {
-    /// The current invariant-set scope: file + innermost enclosing fn (or module).
-    fn scope(&self) -> String {
-        format!("{}#{}", self.file, self.fn_stack.last().map_or("<module>", String::as_str))
+    /// Scope key for the invariant about to be recorded. Invariants inside the same
+    /// `vec!` share the set id (so DUPLICATE compares within one collection); an
+    /// invariant NOT inside a `vec!` set gets a UNIQUE id, so it is never flagged a
+    /// duplicate of anything (we can't prove two loose calls share a set).
+    fn next_scope(&mut self) -> String {
+        match self.set_stack.last() {
+            Some(id) => format!("{}#set{}", self.file, id),
+            None => {
+                let id = self.next_id;
+                self.next_id += 1;
+                format!("{}#solo{}", self.file, id)
+            }
+        }
     }
 }
 
@@ -323,7 +337,7 @@ impl<'ast> Visit<'ast> for ExtractVisitor<'_> {
                     let predicate = self.source_of(pred);
                     let weaknesses = predicate_weaknesses(pred);
                     let line = predicate_line(pred).max(1);
-                    let scope = self.scope();
+                    let scope = self.next_scope();
                     self.out.push(Invariant {
                         name,
                         predicate,
@@ -338,33 +352,27 @@ impl<'ast> Visit<'ast> for ExtractVisitor<'_> {
         visit::visit_expr_call(self, c);
     }
 
-    fn visit_item_fn(&mut self, f: &'ast syn::ItemFn) {
-        self.fn_stack.push(f.sig.ident.to_string());
-        visit::visit_item_fn(self, f);
-        self.fn_stack.pop();
-    }
-
-    fn visit_impl_item_fn(&mut self, f: &'ast syn::ImplItemFn) {
-        self.fn_stack.push(f.sig.ident.to_string());
-        visit::visit_impl_item_fn(self, f);
-        self.fn_stack.pop();
-    }
-
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        // Re-parse the macro body (e.g. `vec![Invariant::new(...), ...]`) as a
-        // comma-separated expression list and visit it, since syn does not descend
-        // into macro token streams. Bounded by `macro_depth` against adversarial
-        // nesting. The re-parsed exprs keep their original file spans, so
-        // `source_of` still slices the real predicate text.
-        if self.macro_depth < MAX_MACRO_DEPTH {
+        // Only descend into `vec!` — the shape that actually builds an invariant
+        // list (`InvariantEngine::new(vec![Invariant::new(...), ...])`). Re-parsing
+        // ARBITRARY macros would extract FAKE invariants from token-data macros
+        // (`stringify!`, `quote!`, custom DSLs) that construct nothing. Each `vec!`
+        // is one invariant SET: its invariants share a scope so DUPLICATE compares
+        // only within the same declared collection.
+        let is_vec = mac.path.segments.last().is_some_and(|s| s.ident == "vec");
+        if is_vec && self.macro_depth < MAX_MACRO_DEPTH {
             if let Ok(exprs) =
                 mac.parse_body_with(Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated)
             {
+                let set_id = self.next_id;
+                self.next_id += 1;
+                self.set_stack.push(set_id);
                 self.macro_depth += 1;
                 for e in &exprs {
                     self.visit_expr(e);
                 }
                 self.macro_depth -= 1;
+                self.set_stack.pop();
             }
         }
         visit::visit_macro(self, mac);
@@ -643,18 +651,44 @@ mod tests {
     }
 
     #[test]
-    fn flags_duplicate_predicates() {
+    fn flags_duplicate_predicates_within_one_set() {
+        // Two identical predicates in the SAME vec! set → the second is a duplicate.
         let src = r#"
             fn f() {
-                let a = Invariant::new("one", |w: &W| w.balance >= 0);
-                let b = Invariant::new("two", |w: &W| w.balance >= 0);
+                let eng = InvariantEngine::new(vec![
+                    Invariant::new("one", |w: &W| w.balance >= 0),
+                    Invariant::new("two", |w: &W| w.balance >= 0),
+                ]);
             }
         "#;
         let r = review(src);
         assert_eq!(r.invariants.len(), 2);
-        // First not flagged, second flagged duplicate.
         assert!(!r.invariants[0].weaknesses.contains(&Weakness::Duplicate));
         assert!(r.invariants[1].weaknesses.contains(&Weakness::Duplicate));
+    }
+
+    #[test]
+    fn same_predicate_in_two_different_sets_is_not_duplicate() {
+        // Two independent engines in the SAME fn, each asserting the same property,
+        // are NOT duplicates of each other — dedup is per-set, not per-fn.
+        let src = r#"
+            fn f() {
+                let e1 = InvariantEngine::new(vec![Invariant::new("a", |w: &W| w.balance >= 0)]);
+                let e2 = InvariantEngine::new(vec![Invariant::new("b", |w: &W| w.balance >= 0)]);
+            }
+        "#;
+        let r = review(src);
+        assert_eq!(r.invariants.len(), 2);
+        assert!(r.invariants.iter().all(|i| !i.weaknesses.contains(&Weakness::Duplicate)));
+    }
+
+    #[test]
+    fn fake_invariant_in_stringify_macro_is_ignored() {
+        // A token-data macro that merely MENTIONS Invariant::new constructs nothing;
+        // it must not be extracted (no fake findings).
+        let src = r#"fn f() { let _ = stringify!(Invariant::new("x", |_| true)); }"#;
+        let r = review(src);
+        assert!(r.invariants.is_empty(), "stringify! must not yield invariants");
     }
 
     #[test]
