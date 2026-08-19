@@ -11,6 +11,7 @@
 mod baseline;
 mod check;
 mod migrate;
+mod presence;
 mod scanner;
 
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use baseline::Baseline;
 use migrate::{migrate_path, CheckOutcome, MigrateOptions, MigrateResult, TraitFamily};
+use presence::{check_path, PresenceReport, Status};
 use scanner::{fingerprint, fix_by_id, rule_by_id, scan_path, Category, Confidence, ScanReport};
 
 /// Exit code for a tool/usage error (bad args, unreadable path).
@@ -242,6 +244,51 @@ enum Commands {
             value_name = "COMMAND"
         )]
         command: Vec<String>,
+    },
+
+    /// Check that DST simulations actually assert something — that invariants are
+    /// PRESENT, not that they are correct.
+    ///
+    /// Seeded replay proves a run is reproducible; it says nothing about whether
+    /// the run checks anything. This flags files that exercise the simulation
+    /// surface (`SimScheduler`, `FaultSchedule`, `SimulatedRandom`, …) but register
+    /// no invariant and make no assertion. It certifies that assertions EXIST; it
+    /// can never certify they are RIGHT — that is domain policy the author owns.
+    ///
+    /// Tiers, per simulation site (file):
+    ///   MISSING  — asserts nothing (no `Invariant`/live `InvariantEngine`, no
+    ///              `.check()`, no `assert!` family). `InvariantEngine::new(vec![])`
+    ///              with an empty list counts as MISSING. `--deny` fails on these.
+    ///   RAW-ONLY — only raw `assert!`-family macros, no declared invariant.
+    ///              Advisory; fails the gate only under `--deny-raw`.
+    ///   OK       — a real invariant is constructed or evaluated.
+    ///
+    /// A NAME-BASED heuristic like `scan`: it errs toward NOT reporting MISSING on
+    /// a file that plausibly asserts (a false OK is the safe direction for a gate),
+    /// and it only sees files it can read and parse — an unreadable file makes a
+    /// `--deny` gate exit 2 rather than pass green.
+    ///
+    /// Exit codes: 0 = clean (or findings without a gate); 1 = a gated tier fired;
+    /// 2 = usage error, or (under a gate) a file could not be read/parsed.
+    Invariants {
+        /// Directory (or file) to check. Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Output format: `human` (default) or `json`. (`sarif`/`github` are not
+        /// meaningful here and fall back to `human`.)
+        #[arg(long, value_enum, value_name = "human|json")]
+        format: Option<Format>,
+
+        /// Turn this into a CI gate: exit non-zero if any simulation site is
+        /// MISSING (asserts nothing).
+        #[arg(long)]
+        deny: bool,
+
+        /// Also fail the gate on RAW-ONLY sites (raw `assert!` macros but no
+        /// declared invariant). Implies `--deny`.
+        #[arg(long)]
+        deny_raw: bool,
     },
 }
 
@@ -473,6 +520,61 @@ fn main() -> ExitCode {
             ignore,
             command,
         } => check::run_check(seed, runs, timeout, &ignore, &command),
+        Commands::Invariants {
+            path,
+            format,
+            deny,
+            deny_raw,
+        } => {
+            // `--deny-raw` implies `--deny`; `deny` is the base gate.
+            let gated = deny || deny_raw;
+
+            // Only human/json are meaningful here; reject sarif/github explicitly
+            // rather than silently treating them as human (the help says
+            // human|json, so accepting more would be a lie).
+            if matches!(format, Some(Format::Sarif) | Some(Format::Github)) {
+                eprintln!("error: `invariants` supports only --format human|json");
+                return ExitCode::from(EXIT_USAGE);
+            }
+
+            // A path that does not exist is a usage error (exit 2), not a "clean"
+            // check — never let a typo look like a passing gate.
+            if !path.exists() {
+                eprintln!("error: path does not exist: {}", path.display());
+                return ExitCode::from(EXIT_USAGE);
+            }
+
+            let report = check_path(&path);
+
+            // `--format json` (and the legacy `--json` is not offered here) emits
+            // the site array; everything else is the human report.
+            match format {
+                Some(Format::Json) => emit_invariants_json(&report),
+                _ => emit_invariants_human(&report, gated, deny_raw),
+            }
+
+            // Exit-code contract mirrors `scan`:
+            //   2 — under a gate, a file could not be read/parsed (cannot certify);
+            //   1 — a gated tier fired (MISSING always; RAW-ONLY under --deny-raw);
+            //   0 — otherwise.
+            if gated && report.uncertifiable() {
+                eprintln!(
+                    "error: cannot certify — {} file(s) could not be read or parsed:",
+                    report.parse_failures.len()
+                );
+                for f in &report.parse_failures {
+                    eprintln!("  {f}");
+                }
+                return ExitCode::from(EXIT_USAGE);
+            }
+            let gate_fails =
+                (gated && report.any_missing()) || (deny_raw && report.any_raw_only());
+            if gate_fails {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
     }
 }
 
@@ -658,6 +760,110 @@ fn emit_migrate(result: &MigrateResult, dry_run: bool) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Human report for `invariants`: one line per simulation site, grouped so the
+/// gate-failing MISSING sites are impossible to miss, then a summary + gate line.
+fn emit_invariants_human(report: &PresenceReport, gated: bool, deny_raw: bool) {
+    println!("== Invariant presence ==\n");
+
+    if report.sites.is_empty() {
+        println!("No simulation sites found (no use of SimScheduler / FaultSchedule / Simulated*).\n");
+    }
+
+    // MISSING first (the defect), then RAW-ONLY (advisory), then OK.
+    for (status, heading) in [
+        (Status::Missing, "MISSING — simulates but asserts nothing"),
+        (Status::RawOnly, "RAW-ONLY — only raw assert! macros, no declared invariant"),
+        (Status::Ok, "OK — a real invariant is registered or checked"),
+    ] {
+        let sites: Vec<_> = report.sites.iter().filter(|s| s.status == status).collect();
+        if sites.is_empty() {
+            continue;
+        }
+        println!("{} ({})", heading, sites.len());
+        for s in sites {
+            let markers = s.sim_markers.join(", ");
+            let detail = match s.status {
+                Status::Missing if s.empty_engine => "  — empty InvariantEngine::new([]) registers nothing".to_string(),
+                Status::RawOnly => format!("  — {} raw assert(s)", s.assert_macros),
+                _ => String::new(),
+            };
+            // A waived site is reported but does not fail the gate — flag it so
+            // the exemption is visible, not silent.
+            let waiver = if s.waived { "  (WAIVED — invariants elsewhere)" } else { "" };
+            println!("  {}:{}  [{}]  uses {}{}{}", s.file, s.sim_line, s.status.label(), markers, detail, waiver);
+        }
+        println!();
+    }
+
+    println!(
+        "Scanned {} file(s): {} parsed, {} skipped (read/parse error).",
+        report.files_scanned,
+        report.files_parsed,
+        report.parse_failures.len()
+    );
+    if !report.parse_failures.is_empty() {
+        for f in &report.parse_failures {
+            println!("  warning: could not parse {f} (skipped)");
+        }
+    }
+    let waived = report.sites.iter().filter(|s| s.waived).count();
+    println!(
+        "{} simulation site(s): {} ok, {} raw-only, {} missing{}.",
+        report.sites.len(),
+        report.tally(Status::Ok),
+        report.tally(Status::RawOnly),
+        report.tally(Status::Missing),
+        if waived > 0 { format!(" ({waived} waived)") } else { String::new() },
+    );
+
+    // Gate line: describe the decision the exit code will encode.
+    if gated {
+        if report.uncertifiable() {
+            println!(
+                "GATE: cannot certify — {} file(s) could not be read or parsed.",
+                report.parse_failures.len()
+            );
+        } else if report.any_missing() {
+            println!("GATE: FAIL — simulation site(s) assert nothing (MISSING).");
+        } else if deny_raw && report.any_raw_only() {
+            println!("GATE: FAIL — RAW-ONLY site(s) under --deny-raw.");
+        } else {
+            let waived = report.sites.iter().filter(|s| s.waived).count();
+            if waived > 0 {
+                println!(
+                    "GATE: pass — every non-waived simulation site asserts something ({waived} waived)."
+                );
+            } else {
+                println!("GATE: pass — every simulation site asserts something.");
+            }
+        }
+    }
+
+    // Honesty footer: a clean result is not a correctness claim.
+    println!(
+        "\nNote: this certifies invariants are PRESENT, not that they are correct — \
+         that stays with the author, written and reviewed as domain policy."
+    );
+}
+
+/// Machine-readable form of `invariants`: a full report object. Emits the sites
+/// AND the scan counts / parse failures / uncertifiable flag, so a machine
+/// consumer under a gate can see that the tree was not fully certifiable without
+/// having to parse stderr and the exit code.
+fn emit_invariants_json(report: &PresenceReport) {
+    let doc = serde_json::json!({
+        "sites": report.sites,
+        "files_scanned": report.files_scanned,
+        "files_parsed": report.files_parsed,
+        "parse_failures": report.parse_failures,
+        "uncertifiable": report.uncertifiable(),
+    });
+    match serde_json::to_string_pretty(&doc) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("failed to serialize report: {e}"),
+    }
 }
 
 /// A short, actionable next step for a finding, keyed off whether `migrate` can
