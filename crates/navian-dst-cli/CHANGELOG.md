@@ -4,6 +4,26 @@ All notable changes to `navian-dst-cli` are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0]
+
+### Added
+
+- **`invariants` subcommand — an assert-something gate.** Seeded replay proves a
+  run is *reproducible*, not that it *asserts* anything. This flags files that
+  drive the simulation surface (`SimScheduler` / `FaultSchedule` / `Simulated*`)
+  but register no invariant and make no assertion: `MISSING` (`--deny` fails),
+  `RAW-ONLY` (only raw `assert!`, `--deny-raw`), `OK`. An unused
+  `InvariantEngine::new(vec![])` counts as `MISSING`; a delegated-check file can opt
+  out with a `navian-dst:invariants-elsewhere` comment. Certifies invariants are
+  present, never that they are correct.
+- **`review` subcommand — adversarial invariant critique.** For every
+  `Invariant::new("name", |state| …)` (including inside `vec![…]`) it flags,
+  deterministically and offline, the structurally hollow ones: `TAUTOLOGY`
+  (can never fail), `IGNORES-STATE` (never reads the state), `DUPLICATE` (same
+  predicate within one `vec!` set). The domain-specific "what are you missing?"
+  critique is emitted as an adversarial prompt for your own LLM/agent, not
+  hardcoded. Advisory — always exits `0`. `--format json`, `--prompt-only`.
+
 ## [0.2.0]
 
 ### Added

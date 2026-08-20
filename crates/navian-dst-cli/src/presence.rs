@@ -105,7 +105,7 @@ const SIM_MARKERS: &[&str] = &[
     "ddmin",
 ];
 
-/// Method names that evaluate an [`navian_dst::InvariantEngine`]. A `.check()` /
+/// Method names that evaluate an `navian_dst::InvariantEngine`. A `.check()` /
 /// `.check_all()` call is counted as declarative-invariant usage even when the
 /// engine value came from a helper and the type name never appears in the file.
 const INVARIANT_CHECK_METHODS: &[&str] = &["check", "check_all"];
@@ -151,7 +151,7 @@ const MAX_NESTING_DEPTH: usize = 512;
 /// before parsing. A rejected file is treated as a read/parse failure (skipped, and
 /// it makes a `--deny` gate uncertifiable → exit 2), never a false pass and never a
 /// crash. Over-rejection can only make the gate stricter, the safe direction.
-fn exceeds_nesting_depth(content: &str) -> bool {
+pub(crate) fn exceeds_nesting_depth(content: &str) -> bool {
     let mut depth: usize = 0;
     for &b in content.as_bytes() {
         match b {

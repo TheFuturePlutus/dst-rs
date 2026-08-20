@@ -152,7 +152,7 @@ impl Category {
 /// How much to trust a finding.
 ///
 /// A name-based lint has genuinely different precision across sources, and the
-/// gate should not fail on the fuzzy ones. `--deny` fails on [`High`] by
+/// gate should not fail on the fuzzy ones. `--deny` fails on [`High`](Confidence::High) by
 /// default; `--deny-level` can lower the threshold. See the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

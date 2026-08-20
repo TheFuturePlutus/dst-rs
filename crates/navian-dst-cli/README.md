@@ -25,6 +25,8 @@ skipped.
 | `explain` | Per-rule fix recipe (human or agent-consumable JSON). |
 | `init` | Scaffold a CI workflow + config stub (never overwrites). |
 | `check` | Run a command N times under a fixed seed; report deterministic vs divergent. |
+| `invariants` | Gate that a DST test actually asserts something — flag simulations that run but register no invariant. |
+| `review` | Adversarially critique the invariants that ARE present (tautology / ignores-state / duplicate) + emit an agent prompt. |
 
 ---
 
@@ -175,6 +177,47 @@ before comparison. Only **stdout and exit status** are compared — stderr is
 captured and shown but not compared. Without `--timeout`, a hanging/deadlocked
 command hangs `check`; `--timeout <secs>` kills and reports an overrunning run
 instead.
+
+### `navian-dst invariants` — assert-something gate
+
+Seeded replay proves a run is *reproducible*; it says nothing about whether the
+run **asserts** anything. A DST test can drive the whole simulation surface
+(`SimScheduler`, `FaultSchedule`, `SimulatedRandom`, …) through thousands of steps
+and register **zero** invariants, then pass green having checked nothing. This gate
+flags those files.
+
+```bash
+navian-dst invariants .           # report
+navian-dst invariants . --deny    # CI gate: fail if any simulation asserts nothing
+```
+
+Per simulation site (file): `MISSING` (asserts nothing — `--deny` fails on it),
+`RAW-ONLY` (only raw `assert!` macros — fails under `--deny-raw`), or `OK` (a real
+invariant is constructed or `.check`ed). An unused `InvariantEngine::new(vec![])`
+counts as `MISSING`. It certifies assertions **exist**, never that they are
+*correct*. A delegated-check file can opt out with a `navian-dst:invariants-elsewhere`
+comment. Exit `0` clean / `1` gated tier fired / `2` usage or unparsable-under-gate.
+
+### `navian-dst review` — adversarial invariant critique
+
+The companion to `invariants`: for every `Invariant::new("name", |state| …)` —
+including inside `vec![…]` — it flags, deterministically and offline, the ones that
+are structurally hollow:
+
+```bash
+navian-dst review .                 # report + an adversarial prompt for your agent
+navian-dst review . --format json   # invariants + weaknesses + prompt, for an agent
+navian-dst review . --prompt-only   # just the critique prompt, to pipe into a tool
+```
+
+- `TAUTOLOGY` — the predicate can never be false (`|_| true`, a pure `cond || true`, `{ true }`).
+- `IGNORES-STATE` — the predicate never reads the state it is handed.
+- `DUPLICATE` — same predicate as another invariant in the same `vec!` set.
+
+The domain-specific "which invariants are you **missing**?" critique is not
+hardcoded (a domain-agnostic tool can't know your vertical) — it is emitted as an
+**adversarial prompt** you hand your own LLM/agent. `review` votes, it never gates:
+it always exits `0` (only a usage error exits `2`).
 
 ## Confidence tiers & exit codes
 
